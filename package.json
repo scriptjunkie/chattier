@@ -3,6 +3,7 @@
   "version": "0.0.2",
   "description": "Secure messaging",
   "main": "src/index.js",
+  "type": "module",
   "scripts": {
     "test": "node test",
     "build": "webpack"
@@ -11,15 +12,9 @@
     "type": "git",
     "url": "git+ssh://git@github.com/scriptjunkie/chattier.git"
   },
-  "keywords": [
-    "secure",
-    "chat",
-    "peer",
-    "messaging",
-    "communications"
-  ],
+  "keywords": ["secure", "chat", "peer", "messaging", "communications"],
   "author": "Matt Weeks (https://scriptjunkie.us/)",
-	"readmeFilename": "README.md",
+  "readmeFilename": "README.md",
   "license": "MIT",
   "bugs": {
     "url": "https://github.com/scriptjunkie/chattier/issues"
