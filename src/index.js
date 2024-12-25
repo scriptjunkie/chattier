@@ -81,14 +81,15 @@ class Note{
 
 	async set_keys_from_password(password, encrypted){
 		if(typeof encrypted === "undefined" || encrypted === null)
-			encrypted = localStorage.getItem('encryptedKey');
+			encrypted = localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME);
 		this.#my_hidden_keys = await decrypt_keys_with_password(encrypted, password);
 		console.log('my keys loaded', this.#my_hidden_keys.pub64);
 	}
 
 	async export_keys_with_password(password){
-		const encd = encrypt_keys_with_password(this.#my_hidden_keys.ecdh.privateKey, password);
-		localStorage.setItem('encryptedKey', encd);
+		console.log('storing and exporting keys');
+		const encd = await encrypt_keys_with_password(this.#my_hidden_keys.ecdh.privateKey, password);
+		localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, encd);
 		return encd;
 	}
 
@@ -495,7 +496,7 @@ context.init();
 
 //save dummy encrypted key with random PW even if never used
 if(localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME) === null){
-	context.generate_keys().then(()=>localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16))))));
+	context.generate_keys().then(()=>context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
 }
 
 export { context };
