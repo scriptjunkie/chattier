@@ -62,6 +62,7 @@ class Note{
 		this.#nodeidx_for_pubkey(this.#my_keys.pub64); //set us as idx 0.
 		this.#my_hidden_keys = await generate();
 		console.log('my node key ', this.#my_keys.pub64);
+		console.log('my hidden key ', this.#my_hidden_keys.pub64);
 		const offset = crypto.getRandomValues(new Uint32Array(1))[0] % seedservers.length;
 		for(let wsurl in this.#known_servers){
 			this.#get_or_set_server_id(wsurl); //will connect if it should
