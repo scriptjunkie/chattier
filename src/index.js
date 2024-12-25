@@ -486,4 +486,4 @@ context.init();
 //save dummy encrypted key with random PW even if never used
 if(localStorage.getItem('encryptedKey') === null) localStorage.setItem('encryptedKey', context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
 
-export context;
+export { context };
