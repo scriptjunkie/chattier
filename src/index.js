@@ -2,6 +2,9 @@ import { pack, unpack, b64encode, b64decode, splice, concat } from './bits.js';
 import { RtcBroker } from './rtcbroker.js';
 import { generate, encrypt_keys_with_password, decrypt_keys_with_password, wrap_to, seal_to, unseal, sign, verify } from './crypto.js';
 
+const LOCAL_STORAGE_ENC_KEY_NAME = "chattier_encrypted_hidden_key";
+const LOCAL_STORAGE_KNOWN_SERVERS_NAME = "chattier_known_servers";
+
 const MESSAGE_SELF_ANNOUNCE = 0x11; //announce your pubkey and ID's
 const MESSAGE_KNOWN_KEYS_AND_LINKS = 0x12;
 const MESSAGE_PING = 0x14;
@@ -51,7 +54,7 @@ class Note{
 		this.#my_keys = null;
 		this.#my_hidden_keys = null;
 		this.#my_peers = {}; //idx -> Set(server_id)
-		const server_cache_string = localStorage.getItem('NoteKnownServers');
+		const server_cache_string = localStorage.getItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME);
 		this.#known_servers = (server_cache_string === null ? {} : JSON.parse(server_cache_string)); //url -> id
 		this.#timeout = setTimeout(() => this.#dosends(), PING_INTERVAL_MS); //send polls regularly
 		console.log('timeout ', this.#timeout);
@@ -60,9 +63,7 @@ class Note{
 	async init(){
 		this.#my_keys = await generate();
 		this.#nodeidx_for_pubkey(this.#my_keys.pub64); //set us as idx 0.
-		this.#my_hidden_keys = await generate();
 		console.log('my node key ', this.#my_keys.pub64);
-		console.log('my hidden key ', this.#my_hidden_keys.pub64);
 		const offset = crypto.getRandomValues(new Uint32Array(1))[0] % seedservers.length;
 		for(let wsurl in this.#known_servers){
 			this.#get_or_set_server_id(wsurl); //will connect if it should
@@ -74,13 +75,22 @@ class Note{
 		}
 	}
 
-	async set_keys_from_password(encrypted, password){
+	async generate_keys(){
+		this.#my_hidden_keys = await generate();
+		await this.#setup_my_forwards();
+	}
+
+	async set_keys_from_password(password, encrypted){
+		if(typeof encrypted === "undefined" || encrypted === null)
+			encrypted = localStorage.getItem('encryptedKey');
 		this.#my_hidden_keys = await decrypt_keys_with_password(encrypted, password);
 		console.log('my keys loaded', this.#my_hidden_keys.pub64);
 	}
 
 	async export_keys_with_password(password){
-		return encrypt_keys_with_password(this.#my_hidden_keys.ecdh.privateKey, password);
+		const encd = encrypt_keys_with_password(this.#my_hidden_keys.ecdh.privateKey, password);
+		localStorage.setItem('encryptedKey', encd);
+		return encd;
 	}
 
 	getlinks(){
@@ -120,7 +130,7 @@ class Note{
 				console.log('MY ID on ', server_id, ' IS ', client_id);
 				this.#set_node_pubkey(make_id(server_id, client_id), this.#my_keys.pub64);
 				this.#my_ids[server_id] = client_id;
-				localStorage.setItem('NoteKnownServers', JSON.stringify(this.#known_servers));
+				localStorage.setItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME, JSON.stringify(this.#known_servers));
 			},
 			(peer_int)=>{ // onnewconn
 				this.#newconn(peer_int, server_id);
@@ -485,6 +495,6 @@ let context = new Note();
 context.init();
 
 //save dummy encrypted key with random PW even if never used
-if(localStorage.getItem('encryptedKey') === null) localStorage.setItem('encryptedKey', context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
+if(localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME) === null) localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
 
 export { context };
