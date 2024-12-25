@@ -77,7 +77,6 @@ class Note{
 
 	async generate_keys(){
 		this.#my_hidden_keys = await generate();
-		await this.#setup_my_forwards();
 	}
 
 	async set_keys_from_password(password, encrypted){
@@ -495,6 +494,8 @@ let context = new Note();
 context.init();
 
 //save dummy encrypted key with random PW even if never used
-if(localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME) === null) localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
+if(localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME) === null){
+	context.generate_keys().then(()=>localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16))))));
+}
 
 export { context };
