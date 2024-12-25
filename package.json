@@ -1,0 +1,32 @@
+{
+  "name": "note",
+  "version": "0.0.1",
+  "description": "Secure messaging",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test",
+    "build": "webpack"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/scriptjunkie/note.git"
+  },
+  "keywords": [
+    "secure",
+    "chat",
+    "peer",
+    "messaging",
+    "communications"
+  ],
+  "author": "Matt Weeks (https://scriptjunkie.us/)",
+	"readmeFilename": "README.md",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/scriptjunkie/note/issues"
+  },
+  "homepage": "https://github.com/scriptjunkie/note#readme"
+  "devDependencies": {
+    "webpack": "*",
+    "webpack-cli": "*"
+  }
+}
