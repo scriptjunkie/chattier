@@ -1,5 +1,5 @@
 {
-  "name": "note",
+  "name": "chattier",
   "version": "0.0.1",
   "description": "Secure messaging",
   "main": "index.js",
@@ -9,7 +9,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/scriptjunkie/note.git"
+    "url": "git+ssh://git@github.com/scriptjunkie/chattier.git"
   },
   "keywords": [
     "secure",
@@ -22,9 +22,9 @@
 	"readmeFilename": "README.md",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/scriptjunkie/note/issues"
+    "url": "https://github.com/scriptjunkie/chattier/issues"
   },
-  "homepage": "https://github.com/scriptjunkie/note#readme"
+  "homepage": "https://github.com/scriptjunkie/chattier#readme",
   "devDependencies": {
     "webpack": "*",
     "webpack-cli": "*"

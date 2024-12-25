@@ -1,8 +1,6 @@
-# Note
+# Chattier
 
 Deniable covert communications.
-
-Like passing notes in class, but more secure.
 
 "Dissidents in repressive regimes or victims of domestic abuse may have their phones occasionally confiscated and scanned, network traffic monitored, they may not be able to install a secure chat app at all, or may be punished for installing one, they may be identified and imprisoned if metadata or contacts show them connected or communicating with someone deemed undesirable at all. I'm not aware of any other system that the information security community recommends or even seeks to build to enable secure communication in these circumstances."
 
