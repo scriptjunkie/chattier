@@ -26,3 +26,10 @@ describe('pack function', () => {
     );
   });
 });
+
+//test function
+// 0 <-> {3,5}   1 <-> {2,4}   2 <-> {1,3}
+describe('test frol', () => {
+	let idx_links = [new Set([3,5]), new Set([2,4]), new Set([1,3]), new Set([0,2]), new Set([1]), new Set([0])];
+	find_route_of_length(0, 3, 3, idx_links); // <- should not throw an error, should not always return the same thing either
+});

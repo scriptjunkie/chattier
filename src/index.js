@@ -13,11 +13,27 @@ const MESSAGE_FWD = 0x15; //scheduled forward
 const MESSAGE_PADDED = 0x16;
 const MESSAGE_SETUP_FORWARD = 0x17; //set up or tear down forward
 const MESSAGE_SEALED = 0x18; //encrypted
+const MESSAGE_LOST_LINK = 0x19;
+const MESSAGE_DEBUG_CON_LOG_REQUEST = 0x20;
+const MESSAGE_DEBUG_CON_LOG = 0x21;
 
 const PING_LENGTH = 1400; //length of a ping
 const PING_INTERVAL_MS = 2000;
 const SIG_LENGTH = 64;
 const KEY_LENGTH = 65;
+
+//console log replacement so we can debug
+let myconlog = [];
+const basetime = (new Date()).getTime();
+function clog(){
+	let argz = [((new Date()).getTime() - basetime)/1000].concat(Array.from(arguments));
+	try{
+		console.log.apply(console, argz);
+		myconlog.push(argz);
+	}catch(e){
+		console.log(e, argz);
+	}
+}
 
 //Note class
 class Note{
@@ -38,6 +54,7 @@ class Note{
 	#my_hidden_keys;
 	#my_peers;
 	#timeout;
+	#con_log_listener;
 
 	constructor(){
 		this.#idx_links = []; //idx -> Set(nodeidx)
@@ -55,16 +72,17 @@ class Note{
 		this.#my_keys = null;
 		this.#my_hidden_keys = null;
 		this.#my_peers = {}; //idx -> {server_id -> peer_int}
+		this.#con_log_listener = null;
 		const server_cache_string = localStorage.getItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME);
 		this.#known_servers = (server_cache_string === null ? {} : JSON.parse(server_cache_string)); //url -> id
 		this.#timeout = setTimeout(() => this.#dosends(), PING_INTERVAL_MS); //send polls regularly
-		console.log('timeout ', this.#timeout);
+		clog('timeout ', this.#timeout);
 	}
 
 	async init(){
 		this.#my_keys = await generate();
 		this.#nodeidx_for_pubkey(this.#my_keys.pub64); //set us as idx 0.
-		console.log('my node key ', this.#my_keys.pub64);
+		clog('my node key ', this.#my_keys.pub64);
 		const offset = crypto.getRandomValues(new Uint32Array(1))[0] % seedservers.length;
 		for(let wsurl in this.#known_servers){
 			this.#get_or_set_server_id(wsurl); //will connect if it should
@@ -76,6 +94,13 @@ class Note{
 		}
 	}
 
+	get_con_logs(idx){
+		const peer_server_id = Object.keys(this.#my_peers[idx])[0];
+		const peer_int = this.#my_peers[idx][peer_server_id];
+		this.#realms[peer_server_id].rtc.send(peer_int, new Uint8Array([MESSAGE_DEBUG_CON_LOG_REQUEST]));
+		return new Promise((cb)=> { this.#con_log_listener = cb; });
+	}
+
 	async generate_keys(){
 		this.#my_hidden_keys = await generate();
 	}
@@ -84,11 +109,11 @@ class Note{
 		if(typeof encrypted === "undefined" || encrypted === null)
 			encrypted = localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME);
 		this.#my_hidden_keys = await decrypt_keys_with_password(encrypted, password);
-		console.log('my keys loaded', this.#my_hidden_keys.pub64);
+		clog('my keys loaded', this.#my_hidden_keys.pub64);
 	}
 
 	async export_keys_with_password(password){
-		console.log('storing and exporting keys');
+		clog('storing and exporting keys');
 		const encd = await encrypt_keys_with_password(this.#my_hidden_keys.ecdh.privateKey, password);
 		localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, encd);
 		return encd;
@@ -104,7 +129,7 @@ class Note{
 			let realm = this.#realms[server_id];
 			realm.rtc.peers().forEach(peer_id => {
 				if((peer_id in realm.queued) && realm.queued[peer_id].length > 0){
-					console.log('sending forward to ', server_id,' ',peer_id);
+					clog('sending forward to ', server_id,' ',peer_id);
 					let to_send = realm.queued[peer_id].splice(0,1)[0];
 					let packed_inner_length = pack(to_send.length);
 					let buf = concat(new Uint8Array[MESSAGE_PADDED], packed_inner_length, to_send, new Uint8Array(PING_LENGTH - 1 - to_send.length));
@@ -122,13 +147,13 @@ class Note{
 		if(Object.keys(this.#realms).length >= 10 || (server_id in this.#realms)){
 			return; //too many servers or alreay connected? Don't connect to it!
 		}
-		console.log('connecting to ',wsurl, ' ',server_id, ' ', JSON.stringify(this.#server_ids));
+		clog('connecting to ',wsurl, ' ',server_id, ' ', JSON.stringify(this.#server_ids));
 		//Set up RTC manager with callbacks to us
 		let broker = new RtcBroker(wsurl, null,
-			()=>{console.log('yucky');}, // onclose
-			()=>{console.log('ducky');}, // onerror
+			()=>{clog('yucky');}, // onclose
+			()=>{clog('ducky');}, // onerror
 			(client_id)=>{ // onstarted
-				console.log('MY ID on ', server_id, ' IS ', client_id);
+				clog('MY ID on ', server_id, ' IS ', client_id);
 				this.#set_node_pubkey(make_id(server_id, client_id), this.#my_keys.pub64);
 				this.#my_ids[server_id] = client_id;
 				localStorage.setItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME, JSON.stringify(this.#known_servers));
@@ -139,33 +164,38 @@ class Note{
 			(node_id)=>{ // onnode
 				//don't really do anything here
 			},
-			(node_id)=>{ // onnodeexit
-				console.log('TODO: propagate handle node exit');
-				//clear node aliases
-				const full_node_id = make_id(server_id, node_id);
+			(peer_int)=>{ // onnodeexit
+				const full_node_id = make_id(server_id, peer_int);
 				if(full_node_id in this.#nodes){
 					const idx = this.#known_key_idxs[this.#nodes[full_node_id]];
 					if(idx in this.#known_aliases){
 						this.#known_aliases[idx].delete(full_node_id);
 					}
-					//Now close peer conn
-					if(idx in this.#my_peers && server_id in this.#my_peers[idx]){
-						delete this.#my_peers[idx][server_id];
-						console.log("lost link idx now num ",Object.keys(this.#my_peers[idx]).length);
-						if(Object.keys(this.#my_peers[idx]).length === 0){ // no longer link to that pkey
-							this.#forget_known_link(0, idx);
-						}
-					}else console.log("how did we lose link",their_node_id,"(",idx,") and not have it?");
+					this.#handle_peer_close(server_id, peer_int);
 					delete this.#nodes[full_node_id];
 				}
-				//if(our_node_id in this.#known_links)
-				//	//TODO: alert peers not on this server node is now gone
-				//	Object.keys(this.#known_links[our_node_id]).forEach(peer=>this.#forget_known_link(our_node_id, peer));
-				//	delete this.#known_links[our_node_id];
 			},
 			(message, peer_int)=>this.#handle_msg(message, server_id, peer_int), //onmessage
+			(peer_int)=>this.#handle_peer_close(server_id, peer_int), //onconnclose
 		);
 		this.#realms[server_id] = {rtc: broker, peer_int_to_idx: {}, queued: {}};
+	}
+
+	#handle_peer_close(server_id, peer_int){
+		//clear node aliases
+		const full_node_id = make_id(server_id, peer_int);
+		if(full_node_id in this.#nodes){
+			const idx = this.#known_key_idxs[this.#nodes[full_node_id]];
+			//Now close peer conn
+			if(idx in this.#my_peers && server_id in this.#my_peers[idx]){
+				delete this.#my_peers[idx][server_id];
+				clog("lost link idx now num ",Object.keys(this.#my_peers[idx]).length);
+				if(Object.keys(this.#my_peers[idx]).length === 0){ // no longer link to that pkey
+					delete this.#my_peers[idx];
+					this.#forget_known_link(0, idx);
+				}
+			}else clog("how did we lose link",their_node_id,"(",idx,") and not have it?");
+		}
 	}
 
 	//Notes a server/peer ID is a given pubkey and returns the idx
@@ -186,26 +216,30 @@ class Note{
 		return this.#known_key_idxs[pub64];
 	}
 
-	#note_known_link(alice_idx, bob_idx, reporter_idx){
-		if(this.#idx_links[alice_idx].has(bob_idx)) return;
-		console.log('Adding new link '+alice_idx+' <-> '+bob_idx, reporter_idx);
-		//send announcement to all peers
-		let message = concat(new Uint8Array([MESSAGE_NEW_LINK]), b64decode(this.#known_keys[alice_idx]), b64decode(this.#known_keys[bob_idx]));
+	//Sends a message immediately to all direct peers except for the listed idx's.
+	#send_all_peers(message, idx1, idx2, idx3){
 		for(let idx in this.#my_peers){
-			if(idx === reporter_idx || idx === alice_idx || idx === bob_idx) continue; // don't report back to who reported it to us
+			if(idx === idx1 || idx === idx2 || idx === idx3) continue; // don't report back to who reported it to us
 			const peer_server_id = Object.keys(this.#my_peers[idx])[0];
 			const peer_int = this.#my_peers[idx][peer_server_id];
 			this.#realms[peer_server_id].rtc.send(peer_int, message);
 		}
+	}
+
+	#note_known_link(alice_idx, bob_idx, reporter_idx){
+		if(this.#idx_links[alice_idx].has(bob_idx)) return;
+		clog('Adding new link '+alice_idx+' <-> '+bob_idx, reporter_idx);
+		let message = concat(new Uint8Array([MESSAGE_NEW_LINK]), b64decode(this.#known_keys[alice_idx]), b64decode(this.#known_keys[bob_idx]));
+		this.#send_all_peers(message, reporter_idx, alice_idx, bob_idx); //send announcement to all peers
 		this.#idx_links[alice_idx].add(bob_idx);
 		this.#idx_links[bob_idx].add(alice_idx);
 	}
 
-	#forget_known_link(alice_idx, bob_idx){
-		if(this.#idx_links[alice_idx].has(bob_idx)){
-			console.log('FORGETTING lost link '+alice_idx+' <-> '+bob_idx);
-			//TODO update peers about link change
-		}else console.log('NOT forgetting lost link '+alice_idx+' <-> '+bob_idx+'?');
+	#forget_known_link(alice_idx, bob_idx, reporter_idx){
+		if(!this.#idx_links[alice_idx].has(bob_idx)) return;
+		clog('FORGETTING lost link '+alice_idx+' <-> '+bob_idx);
+		let message = concat(new Uint8Array([MESSAGE_LOST_LINK]), b64decode(this.#known_keys[alice_idx]), b64decode(this.#known_keys[bob_idx]));
+		this.#send_all_peers(message, reporter_idx, alice_idx, bob_idx); //send announcement to all peers
 		this.#idx_links[alice_idx].delete(bob_idx);
 		this.#idx_links[bob_idx].delete(alice_idx);
 	}
@@ -215,18 +249,18 @@ class Note{
 		// send MESSAGE_SELF_ANNOUNCE (code, pubraw, [known servers], 0, [my aliases]...
 		let messagechunks = [new Uint8Array([MESSAGE_SELF_ANNOUNCE]), this.#my_keys.pubraw];
 		for(let server_j in this.#server_ids){
-			console.log('sending server ID ', server_j);
+			clog('sending server ID ', server_j);
 			const serverurl = new TextEncoder().encode(this.#server_ids[server_j]);
 			messagechunks = messagechunks.concat([pack(server_j), pack(serverurl.length), serverurl]);
 		}
-		console.log('done sending server IDs ' + JSON.stringify(this.#server_ids));
+		clog('done sending server IDs ' + JSON.stringify(this.#server_ids));
 		messagechunks.push(new Uint8Array([0]));
 		for(let server_j in this.#my_ids){
 			messagechunks.push(pack(server_j));
 			messagechunks.push(pack(this.#my_ids[server_j]));
 		}
 		const announce = await (new Blob(messagechunks).arrayBuffer());
-		console.log('sending self announcement to ', peer_id,' length ',announce.byteLength);
+		clog('sending self announcement to ', peer_id,' length ',announce.byteLength);
 		this.#realms[server_id].rtc.send(peer_id,announce);
 
 		// Send known keys and links by nodeid
@@ -244,7 +278,7 @@ class Note{
 			}
 		}
 		const keys_and_links = await (new Blob(known_keys_and_links_chunks).arrayBuffer());
-		console.log('sending keys and links to ', peer_id,' length ',keys_and_links.byteLength);
+		clog('sending keys and links to ', peer_id,' length ',keys_and_links.byteLength);
 		this.#realms[server_id].rtc.send(peer_id, keys_and_links);
 	}
 
@@ -254,7 +288,7 @@ class Note{
 			message_data = await message_data.arrayBuffer(); //firefox gives you blobs, chrome arraybuffers
 		}
 		let message = new Uint8Array(message_data);
-		//console.log('Inbound message from '+server_id+'_'+peer_int+' len '+message.length);
+		//clog('Inbound message from '+server_id+'_'+peer_int+' len '+message.length);
 		let code;
 		[code, message] = unpack(message);
 		if(code === MESSAGE_SELF_ANNOUNCE){
@@ -262,7 +296,7 @@ class Note{
 			[pubk, message] = splice(message, KEY_LENGTH);
 			const peer_b64 = b64encode(pubk);
 			const their_idx = this.#set_node_pubkey(make_id(server_id, peer_int), peer_b64); //this makes them a new node if not known before
-			console.log('self announce from '+server_id+'_'+peer_int+' which is now ID '+their_idx);
+			clog('self announce from '+server_id+'_'+peer_int+' which is now ID '+their_idx);
 			this.#note_known_link(0, their_idx, their_idx); //save the link. We're always 0
 			if(!(their_idx in this.#my_peers)){
 				this.#my_peers[their_idx] = {};
@@ -279,15 +313,22 @@ class Note{
 				const server_url = new TextDecoder().decode(server_url_bin);
 				const our_server_id = this.#get_or_set_server_id(server_url);
 				their_server_id_to_ours[their_server_id] = our_server_id;
-				console.log('their server_url ', server_url, ' at ', their_server_id, ' ours ', our_server_id);
+				clog('their server_url ', server_url, ' at ', their_server_id, ' ours ', our_server_id);
 			}
 			while(message.length > 0){
 				let their_server_id, their_client_id;
 				[their_server_id, message] = unpack(message);
 				[their_client_id, message] = unpack(message);
-				console.log("peer's alias ", their_server_id, ' (',their_server_id_to_ours[their_server_id],') ', their_client_id);
+				clog("peer's alias ", their_server_id, ' (',their_server_id_to_ours[their_server_id],') ', their_client_id);
 				this.#set_node_pubkey(make_id(their_server_id_to_ours[their_server_id], their_client_id), peer_b64);
 			}
+		}else if(code === MESSAGE_DEBUG_CON_LOG){
+			if(this.#con_log_listener){
+				this.#con_log_listener(JSON.parse(new TextDecoder().decode(message)));
+				this.#con_log_listener = null;
+			}
+		}else if(code === MESSAGE_DEBUG_CON_LOG_REQUEST){
+			this.#realms[server_id].rtc.send(peer_int, concat(new Uint8Array([MESSAGE_DEBUG_CON_LOG]), new TextEncoder().encode(JSON.stringify(myconlog))));
 		}else if(code === MESSAGE_KNOWN_KEYS_AND_LINKS){
 			let num_keys;
 			[num_keys, message] = unpack(message);
@@ -297,7 +338,7 @@ class Note{
 				[pubk, message] = splice(message, KEY_LENGTH);
 				const pubk64 = b64encode(pubk);
 				their_nodeid_to_ours[i] = this.#nodeidx_for_pubkey(pubk64);
-				console.log('received note of key ',pubk64,' - node ', this.#nodeidx_for_pubkey(pubk64));
+				clog('received note of key ',pubk64,' - node ', this.#nodeidx_for_pubkey(pubk64), 'from', their_nodeid_to_ours[0]);
 			}
 			const their_idx = their_nodeid_to_ours[0]; //Get their idx
 			while(message.length > 0){
@@ -306,14 +347,19 @@ class Note{
 				[dst_their_nodeid, message] = unpack(message); //TODO: validate?
 				const our_src_id = their_nodeid_to_ours[src_their_nodeid];
 				const our_dst_id = their_nodeid_to_ours[dst_their_nodeid];
-				console.log('received note of link ',our_src_id,' -> ', our_dst_id);
+				clog('received note of link ',our_src_id,' -> ', our_dst_id);
 				this.#note_known_link(our_src_id, our_dst_id, their_idx); //save the link
 			}
 		}else if(code === MESSAGE_NEW_LINK){ //Just src, dst keys
 			const arr = splice(message, KEY_LENGTH).map(a=>this.#nodeidx_for_pubkey(b64encode(a)));
-			console.log("MESSAGE_NEW_LINK", arr[0], arr[1], 'from', server_id+'_'+peer_int);
+			clog("MESSAGE_NEW_LINK", arr[0], arr[1], 'from', server_id+'_'+peer_int);
 			const their_idx = this.#realms[server_id].peer_int_to_idx[peer_int]; // this should be set by now
 			this.#note_known_link(arr[0], arr[1], their_idx);
+		}else if(code === MESSAGE_LOST_LINK){ //Just src, dst keys. TODO: sign this
+			const arr = splice(message, KEY_LENGTH).map(a=>this.#nodeidx_for_pubkey(b64encode(a)));
+			clog("MESSAGE_LOST_LINK", arr[0], arr[1], 'from', server_id+'_'+peer_int);
+			const their_idx = this.#realms[server_id].peer_int_to_idx[peer_int]; // this should be set by now
+			this.#forget_known_link(arr[0], arr[1], their_idx);
 		}else if(code === MESSAGE_FWD){
 			let next_key, next_wrap;
 			[next_key, message] = splice(message, KEY_LENGTH);
@@ -323,7 +369,7 @@ class Note{
 				message = concat(new Uint8Array([MESSAGE_FWD]), next_wrap, await seal_to(message, next_wrap)); //and wrap to the wrap key
 			}
 			if(!(next_b64 in this.#known_key_idxs)){
-				console.log("WARNING: next hop "+next_b64+" unknown - dropping message");
+				clog("WARNING: next hop "+next_b64+" unknown - dropping message");
 				return;
 			}
 			let next_nodeid = this.#known_key_idxs[next_b64];
@@ -334,14 +380,14 @@ class Note{
 				for(let i = 0; i < peers.length; i++){
 					const candidate_peer_id = peers[i];
 					if(candidate_peer_id === peer_id){
-						console.log('Queueing forward to ', next_b64, ' (',server_id,'_',peer_id,')'); //here's our stop!
+						clog('Queueing forward to ', next_b64, ' (',server_id,'_',peer_id,')'); //here's our stop!
 						if(!(peer_id in realm.queued)) realm.queued[peer_id] = [];
 						realm.queued[peer_id].push(message);
 						return;
 					}
 				}
 			}
-			console.log('WARNING: next hop '+next_b64+' not direct link - dropping message');
+			clog('WARNING: next hop '+next_b64+' not direct link - dropping message');
 		}else if(code === MESSAGE_PADDED){
 			let inner_length;
 			[inner_length, message] = unpack(message);
@@ -358,10 +404,10 @@ class Note{
 				[next_wrap, message] = splice(message, KEY_LENGTH);
 				this.#my_forwards[b64encode(next_keyraw)] = [next_hop, next_wrap]; //key -> next_hop_key, next_wrapping_key
 			}else{
-				console.log('WARNING: bad forward setup?');
+				clog('WARNING: bad forward setup?');
 			}
 		}else if(code !== MESSAGE_PING){
-			console.log('unknown message ', message);
+			clog('unknown message ', message);
 		}
 	}
 
@@ -371,7 +417,7 @@ class Note{
 
 	async #setup_my_forwards(){
 		if(this.#idx_links.length < 3 || this.#idx_links[this.#known_key_idxs[this.#my_keys.pubraw]].size < 2){
-			console.log('not enough nodes to setup forwards');
+			clog('not enough nodes to setup forwards');
 			return false;
 		}
 		//pick several hops (2 for now, if we can find them) and generate a key for each.
@@ -413,7 +459,7 @@ class Note{
 		for(let server_peer_id of this.#known_aliases[rand_route_indexed[1]]){ //e.g. server_peer_id = "1_4"
 			let [server_id, peer_id] = server_peer_id.split('_').map(f=>parseInt(f));
 			if(server_id in this.#realms && peer_id in this.#realms[server_id].queued){
-				console.log('queuing relayed send to '+server_peer_id);
+				clog('queuing relayed send to '+server_peer_id);
 				this.#realms[server_id].queued[peer_id].push(sealed_to_hop);
 				break;
 			}
@@ -435,11 +481,10 @@ class Note{
 	}
 }
 
-
 //Pick a random (securish) out of a list or throw an exception
 function random_choice(disarray){
 	if(disarray.length === 0){
-		console.log('NO OPTIONS');
+		clog('NO OPTIONS');
 		throw 'NO OPTIONS';
 	}
 	return disarray[crypto.getRandomValues(new Uint32Array(1))[0] % disarray.length];
@@ -484,13 +529,6 @@ function find_route_of_length(src, length, dst, idx_links){
 	return random_path(choice, hops_from_src, idx_links).reverse().concat(random_path(choice, hops_from_dst, idx_links).slice(1));
 }
 
-//test function
-// 0 <-> {3,5}   1 <-> {2,4}   2 <-> {1,3}
-//#test_frol(){
-//	let idx_links = [new Set([3,5]), new Set([2,4]), new Set([1,3]), new Set([0,2]), new Set([1]), new Set([0])];
-//	find_route_of_length(0, 3, 3, idx_links); // <- should not throw an error, should not always return the same thing either
-//}
-
 function make_id(server_id, client_id) {
 	return server_id + '_' + client_id;
 }
@@ -513,4 +551,4 @@ if(localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME) === null){
 	context.generate_keys().then(()=>context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
 }
 
-export { context };
+export { context, find_route_of_length };

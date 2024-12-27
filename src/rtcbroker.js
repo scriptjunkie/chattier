@@ -15,8 +15,9 @@ class RtcBroker {
 	#onnode;
 	#onnodeexit;
 	#onmessage;
+	#on_conn_close;
 	
-	constructor(wsurl, zone, onclose, onerror, onstarted, onnewconn, onnode, onnodeexit, onmessage) {
+	constructor(wsurl, zone, onclose, onerror, onstarted, onnewconn, onnode, onnodeexit, onmessage, onconnclose) {
 		this.#client_id = null;
 		this.#links = {};
 		this.#pending_peer_connections = {};
@@ -25,6 +26,7 @@ class RtcBroker {
 		this.#onnode = onnode;
 		this.#onnodeexit = onnodeexit;
 		this.#onmessage = onmessage;
+		this.#on_conn_close = onconnclose;
 		console.log('connecting to ', wsurl);
 		//Now do the connection
 		zone=(zone && zone.length == 32 ? zone : '00000000000000000000000000000000');
@@ -59,6 +61,7 @@ class RtcBroker {
 		console.log(message, peer_id);
 		if(peer_id in this.#links) delete this.#links[peer_id];
 		if(peer_id in this.#pending_peer_connections) delete this.#pending_peer_connections[peer_id];
+		if(this.#on_conn_close) this.#on_conn_close(peer_id);
 	}
 
 	//web socket message function
