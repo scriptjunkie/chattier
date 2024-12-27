@@ -7,6 +7,7 @@ const LOCAL_STORAGE_KNOWN_SERVERS_NAME = "chattier_known_servers";
 
 const MESSAGE_SELF_ANNOUNCE = 0x11; //announce your pubkey and ID's
 const MESSAGE_KNOWN_KEYS_AND_LINKS = 0x12;
+const MESSAGE_NEW_LINK = 0x13;
 const MESSAGE_PING = 0x14;
 const MESSAGE_FWD = 0x15; //scheduled forward
 const MESSAGE_PADDED = 0x16;
@@ -53,7 +54,7 @@ class Note{
 		this.#realms = {}; //server_id -> {rtc, [our stuff]}
 		this.#my_keys = null;
 		this.#my_hidden_keys = null;
-		this.#my_peers = {}; //idx -> Set(server_id)
+		this.#my_peers = {}; //idx -> {server_id -> peer_int}
 		const server_cache_string = localStorage.getItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME);
 		this.#known_servers = (server_cache_string === null ? {} : JSON.parse(server_cache_string)); //url -> id
 		this.#timeout = setTimeout(() => this.#dosends(), PING_INTERVAL_MS); //send polls regularly
@@ -148,10 +149,10 @@ class Note{
 						this.#known_aliases[idx].delete(full_node_id);
 					}
 					//Now close peer conn
-					if(idx in this.#my_peers && this.#my_peers[idx].has(server_id)){
-						this.#my_peers[idx].delete(server_id);
-						console.log("lost link idx now num ",this.#my_peers[idx].size);
-						if(this.#my_peers[idx].size === 0){ // no longer link to that pkey
+					if(idx in this.#my_peers && server_id in this.#my_peers[idx]){
+						delete this.#my_peers[idx][server_id];
+						console.log("lost link idx now num ",Object.keys(this.#my_peers[idx]).length);
+						if(Object.keys(this.#my_peers[idx]).length === 0){ // no longer link to that pkey
 							this.#forget_known_link(0, idx);
 						}
 					}else console.log("how did we lose link",their_node_id,"(",idx,") and not have it?");
@@ -164,9 +165,10 @@ class Note{
 			},
 			(message, peer_int)=>this.#handle_msg(message, server_id, peer_int), //onmessage
 		);
-		this.#realms[server_id] = {rtc: broker, their_server_id_to_ours: {}, their_nodeid_to_ours: {}, queued: {}};
+		this.#realms[server_id] = {rtc: broker, peer_int_to_idx: {}, queued: {}};
 	}
 
+	//Notes a server/peer ID is a given pubkey and returns the idx
 	#set_node_pubkey(server_peer_id, pub64){
 		this.#nodes[server_peer_id] = pub64;
 		let their_idx = this.#nodeidx_for_pubkey(pub64);
@@ -176,7 +178,7 @@ class Note{
 
 	#nodeidx_for_pubkey(pub64) {
 		if(!(pub64 in this.#known_key_idxs)){ //newly known node!
-			this.#known_key_idxs[pub64] = this.#known_keys.length; //key64 -> nodeid
+			this.#known_key_idxs[pub64] = this.#known_keys.length;
 			this.#known_keys.push(pub64); // nodeid -> key64
 			this.#known_aliases.push(new Set());
 			this.#idx_links.push(new Set());
@@ -184,10 +186,16 @@ class Note{
 		return this.#known_key_idxs[pub64];
 	}
 
-	#note_known_link(alice_idx, bob_idx){
-		if(!this.#idx_links[alice_idx].has(bob_idx)){
-			console.log('Adding new link '+alice_idx+' <-> '+bob_idx);
-			//TODO update peers about link change
+	#note_known_link(alice_idx, bob_idx, reporter_idx){
+		if(this.#idx_links[alice_idx].has(bob_idx)) return;
+		console.log('Adding new link '+alice_idx+' <-> '+bob_idx, reporter_idx);
+		//send announcement to all peers
+		let message = concat(new Uint8Array([MESSAGE_NEW_LINK]), b64decode(this.#known_keys[alice_idx]), b64decode(this.#known_keys[bob_idx]));
+		for(let idx in this.#my_peers){
+			if(idx === reporter_idx || idx === alice_idx || idx === bob_idx) continue; // don't report back to who reported it to us
+			const peer_server_id = Object.keys(this.#my_peers[idx])[0];
+			const peer_int = this.#my_peers[idx][peer_server_id];
+			this.#realms[peer_server_id].rtc.send(peer_int, message);
 		}
 		this.#idx_links[alice_idx].add(bob_idx);
 		this.#idx_links[bob_idx].add(alice_idx);
@@ -204,9 +212,6 @@ class Note{
 
 	//what to do when a new peer connection happens
 	async #newconn(peer_id, server_id){
-		// Prep mapping translation table
-		this.#realms[server_id].their_server_id_to_ours[peer_id] = {};
-		this.#realms[server_id].their_nodeid_to_ours[peer_id] = {};
 		// send MESSAGE_SELF_ANNOUNCE (code, pubraw, [known servers], 0, [my aliases]...
 		let messagechunks = [new Uint8Array([MESSAGE_SELF_ANNOUNCE]), this.#my_keys.pubraw];
 		for(let server_j in this.#server_ids){
@@ -258,10 +263,13 @@ class Note{
 			const peer_b64 = b64encode(pubk);
 			const their_idx = this.#set_node_pubkey(make_id(server_id, peer_int), peer_b64); //this makes them a new node if not known before
 			console.log('self announce from '+server_id+'_'+peer_int+' which is now ID '+their_idx);
-			this.#note_known_link(0, their_idx); //save the link. We're always 0
-			if(!(their_idx in this.#my_peers))
-				this.#my_peers[their_idx] = new Set();
-			this.#my_peers[their_idx].add(server_id);
+			this.#note_known_link(0, their_idx, their_idx); //save the link. We're always 0
+			if(!(their_idx in this.#my_peers)){
+				this.#my_peers[their_idx] = {};
+			}
+			this.#my_peers[their_idx][server_id] = peer_int;
+			this.#realms[server_id].peer_int_to_idx[peer_int] = their_idx;
+			let their_server_id_to_ours = {};
 			while(message.length > 0){
 				let their_server_id, server_url_length, server_url_bin;
 				[their_server_id, message] = unpack(message);
@@ -270,36 +278,42 @@ class Note{
 				[server_url_bin, message] = splice(message, server_url_length);
 				const server_url = new TextDecoder().decode(server_url_bin);
 				const our_server_id = this.#get_or_set_server_id(server_url);
-				this.#realms[server_id].their_server_id_to_ours[peer_int][their_server_id] = our_server_id;
+				their_server_id_to_ours[their_server_id] = our_server_id;
 				console.log('their server_url ', server_url, ' at ', their_server_id, ' ours ', our_server_id);
 			}
 			while(message.length > 0){
 				let their_server_id, their_client_id;
 				[their_server_id, message] = unpack(message);
 				[their_client_id, message] = unpack(message);
-				console.log("peer's alias ", their_server_id, ' (',this.#realms[server_id].their_server_id_to_ours[peer_int][their_server_id],') ', their_client_id);
-				this.#set_node_pubkey(make_id(this.#realms[server_id].their_server_id_to_ours[peer_int][their_server_id], their_client_id), peer_b64);
+				console.log("peer's alias ", their_server_id, ' (',their_server_id_to_ours[their_server_id],') ', their_client_id);
+				this.#set_node_pubkey(make_id(their_server_id_to_ours[their_server_id], their_client_id), peer_b64);
 			}
 		}else if(code === MESSAGE_KNOWN_KEYS_AND_LINKS){
 			let num_keys;
 			[num_keys, message] = unpack(message);
+			let their_nodeid_to_ours = {};
 			for(let i = 0; i < num_keys; i++){
 				let pubk;
 				[pubk, message] = splice(message, KEY_LENGTH);
 				const pubk64 = b64encode(pubk);
-				this.#realms[server_id].their_nodeid_to_ours[peer_int][i] = this.#nodeidx_for_pubkey(pubk64);
+				their_nodeid_to_ours[i] = this.#nodeidx_for_pubkey(pubk64);
 				console.log('received note of key ',pubk64,' - node ', this.#nodeidx_for_pubkey(pubk64));
 			}
+			const their_idx = their_nodeid_to_ours[0]; //Get their idx
 			while(message.length > 0){
 				let src_their_nodeid, dst_their_nodeid;
 				[src_their_nodeid, message] = unpack(message);
 				[dst_their_nodeid, message] = unpack(message); //TODO: validate?
-				//TODO: fix bug where our_src_id/our_dst_id get undefined since we haven't put together a mapping yet since MESSAGE_KNOWN_KEYS hasn't arrived yet
-				const our_src_id = this.#realms[server_id].their_nodeid_to_ours[peer_int][src_their_nodeid];
-				const our_dst_id = this.#realms[server_id].their_nodeid_to_ours[peer_int][dst_their_nodeid];
+				const our_src_id = their_nodeid_to_ours[src_their_nodeid];
+				const our_dst_id = their_nodeid_to_ours[dst_their_nodeid];
 				console.log('received note of link ',our_src_id,' -> ', our_dst_id);
-				this.#note_known_link(our_src_id, our_dst_id); //save the link
+				this.#note_known_link(our_src_id, our_dst_id, their_idx); //save the link
 			}
+		}else if(code === MESSAGE_NEW_LINK){ //Just src, dst keys
+			const arr = splice(message, KEY_LENGTH).map(a=>this.#nodeidx_for_pubkey(b64encode(a)));
+			console.log("MESSAGE_NEW_LINK", arr[0], arr[1], 'from', server_id+'_'+peer_int);
+			const their_idx = this.#realms[server_id].peer_int_to_idx[peer_int]; // this should be set by now
+			this.#note_known_link(arr[0], arr[1], their_idx);
 		}else if(code === MESSAGE_FWD){
 			let next_key, next_wrap;
 			[next_key, message] = splice(message, KEY_LENGTH);
