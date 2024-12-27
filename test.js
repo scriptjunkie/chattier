@@ -1,4 +1,5 @@
 import { pack } from './src/bits.js';
+import { find_route_of_length } from './src/algorithms.js';
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
