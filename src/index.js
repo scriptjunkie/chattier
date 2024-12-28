@@ -286,7 +286,6 @@ class Note{
 			message_data = await message_data.arrayBuffer(); //firefox gives you blobs, chrome arraybuffers
 		}
 		let message = new Uint8Array(message_data);
-		//clog('Inbound message from '+server_id+'_'+peer_int+' len '+message.length);
 		let code;
 		[code, message] = unpack(message);
 		if(code === MESSAGE_SELF_ANNOUNCE){
@@ -481,14 +480,6 @@ class Note{
 
 function make_id(server_id, client_id) {
 	return server_id + '_' + client_id;
-}
-
-function idstr_to_bin(idstr){
-	const chunks = idstr.split('_').map(f=>pack(parseInt(f)));
-	let retval = new Uint8Array(chunks[0].length + chunks[1].length);
-	retval.set(chunks[0], 0);
-	retval.set(chunks[1], chunks[0].length);
-	return retval;
 }
 
 let context = new Note();
