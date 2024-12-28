@@ -1,8 +1,6 @@
 // RTC broker - automatically establishes a set of peer connections using a websocket broker
 import { random_choice } from './algorithms.js';
 
-const MIN_CONNECTIONS = 1; //try to always ensure this many connections
-
 const CODE_FULL_LIST = 1;
 const CODE_CLIENT_EXIT = 2;
 const CODE_CLIENT_RTC_REQUEST = 3;
@@ -21,8 +19,10 @@ class RtcBroker {
 	#on_conn_close;
 	#recheck_timer;
 	#known_clients;
+	#newclient;
+	#sock;
 	
-	constructor(wsurl, zone, onclose, onerror, onstarted, onnewconn, onnodeexit, onmessage, onconnclose) {
+	constructor(wsurl, zone, onclose, onerror, onstarted, onnewconn, onnodeexit, onmessage, onconnclose, onnewclient) {
 		this.#client_id = null;
 		this.#links = {};
 		this.#pending_peer_connections = {};
@@ -31,13 +31,14 @@ class RtcBroker {
 		this.#onnodeexit = onnodeexit;
 		this.#onmessage = onmessage;
 		this.#on_conn_close = onconnclose;
+		this.#newclient = onnewclient;
 		this.#recheck_timer = null;
 		this.#known_clients = new Set();
 		console.log('connecting to ', wsurl);
 		//Now do the connection
 		zone=(zone && zone.length == 32 ? zone : '00000000000000000000000000000000');
-		let sock = new WebSocket(wsurl);
-		sock.onclose = e => {
+		this.#sock = new WebSocket(wsurl);
+		this.#sock.onclose = e => {
 			console.log('websocket ',wsurl,' closing ',e);
 			if(this.#recheck_timer !== null){
 				clearInterval(this.#recheck_timer);
@@ -45,7 +46,7 @@ class RtcBroker {
 			}
 			onclose(e);
 		};
-		sock.onerror = e => {
+		this.#sock.onerror = e => {
 			console.log('websocket ',wsurl,' error ',e);
 			if(this.#recheck_timer !== null){
 				clearInterval(this.#recheck_timer);
@@ -53,16 +54,20 @@ class RtcBroker {
 			}
 			onerror(e);
 		};
-		sock.onopen = e => {
+		this.#sock.onopen = e => {
 			console.log('websocket opened to ', wsurl);
-			sock.send(new Uint32Array([zone.substr(24,8),zone.substr(16,8),zone.substr(8,8),zone.substr(0,8)].map(z=>parseInt(z,16))).buffer);
+			this.#sock.send(new Uint32Array([zone.substr(24,8),zone.substr(16,8),zone.substr(8,8),zone.substr(0,8)].map(z=>parseInt(z,16))).buffer);
 		};
-		sock.onmessage = (msg) => this.#handle_websocket_message(msg, sock);
+		this.#sock.onmessage = (msg) => this.#handle_websocket_message(msg);
 	}
 
 	//returns list of peers
 	peers(){
 		return Object.keys(this.#links);
+	}
+
+	has_link(peer_id){
+		return peer_id in this.#links;
 	}
 
 	//sends an arrayBuffer to a peer
@@ -79,7 +84,7 @@ class RtcBroker {
 	}
 
 	//web socket message function
-	async #handle_websocket_message(msgevt, sock) {
+	async #handle_websocket_message(msgevt) {
 		const u8 = new Uint8Array(await msgevt.data.arrayBuffer());
 		if(u8[0] == CODE_CLIENT_ANNOUNCE){
 			const announced_int = new Uint32Array(u8.slice(1,5).buffer)[0];
@@ -88,10 +93,8 @@ class RtcBroker {
 				this.#client_id = announced_int;
 				if(this.#onstarted)
 					this.#onstarted(announced_int);
-			}else if (Math.random() < 2 / (1 + Object.keys(this.#links).length)){ //new peer - connect with decreasing probability
-				this.#connectto(announced_int, sock);
-			}else {
-				console.log('Not trying to connect to new peer ',announced_int,'. We already have ',Object.keys(this.#links).length);
+			}else if(this.#newclient){
+				this.#newclient(announced_int);
 			}
 		}else if(u8[0] == CODE_CLIENT_RTC_REQUEST && u8.length > 5){
 			const peer_id = new Uint32Array(u8.slice(1,5).buffer)[0];
@@ -110,9 +113,13 @@ class RtcBroker {
 			};
 				
 			if(peer_id in this.#pending_peer_connections){
-				console.log('already in pending_peer_connections with state of ', this.#pending_peer_connections[peer_id].rtcpc.connectionState, ' and ice connection state of ',this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState,' probably learned new ICE option');
-				if(this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState !== 'connected')
+				console.log('already in pending_peer_connections with state of ', this.#pending_peer_connections[peer_id].rtcpc.connectionState, ' and ice connection state of ',this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState,' maybe learned new ICE option?');
+				if(typeof this.#pending_peer_connections[peer_id].ices === 'undefined'){
+					console.log("Simultaneous open. Something probably got stuck. Ignoring this one.");
+					return;
+				}else if(this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState !== 'connected'){
 					submitIces(this.#pending_peer_connections[peer_id].rtcpc, rtcRequest.connectToMePlz);
+				}
 				return; //DONE
 			}
 			//create connection with same stun server hopefully
@@ -153,7 +160,7 @@ class RtcBroker {
 				rtcrespmsg[5] = CODE_CLIENT_RTC_RESPONSE;
 				rtcrespmsg.subarray(6,10).set(new Uint32Array([this.#client_id]));
 				rtcrespmsg.set(plainbytes, 10);
-				sock.send(rtcrespmsg);
+				this.#sock.send(rtcrespmsg);
 			};
 			inboundPeerConn.onconnectionstatechange = () => {
 				console.log('inboundPeerConn onconnectionstatechange',peer_id,inboundPeerConn.connectionState); //'failed' if it dies
@@ -234,24 +241,18 @@ class RtcBroker {
 				this.#onnodeexit(peer_id);
 		}else if(u8[0] == CODE_FULL_LIST){ //we don't want to reach out here; they should try to reach us
 			Array.from(new Uint32Array(u8.slice(1).buffer)).forEach((id) => this.#known_clients.add(id)); //put all known clients in our set
-			this.#recheck_timer = setInterval(()=>{ //but if they don't in a little bit, connect to one
-				if(Object.keys(this.#pending_peer_connections).length + Object.keys(this.#links).length < MIN_CONNECTIONS){
-					let validids = [];
-					 for(let id of this.#known_clients){
-						if(id !== this.#client_id && !(id in this.#links) && !(id in this.#pending_peer_connections)){
-							validids.push(id);
-						}
-					}
-					if(validids.length > 0){
-						console.log("Few open connections - attempting to force new connection");
-						this.#connectto(random_choice(validids), sock);
-					}
-				}
-			}, 5000);
 		}
 	}
 
-	async #connectto(peer_id, sock){
+	num_pending(){
+		return Object.keys(this.#pending_peer_connections).length;
+	}
+
+	known_clients(){
+		return this.#known_clients;
+	}
+
+	async connectto(peer_id){
 		if(peer_id in this.#links || peer_id === this.#client_id){
 			console.log('already connected to ',peer_id);
 			return;
@@ -269,9 +270,10 @@ class RtcBroker {
 		setTimeout(()=>{
 			if(peer_id in this.#pending_peer_connections && this.#pending_peer_connections[peer_id].started === ci.started){
 				console.log('RTC INITIATOR TIMED OUT :-(');
+				delete this.#pending_peer_connections[peer_id];
 				ci.rtcpc.close();
 			}
-		},30000);
+		},20000);
 		this.#pending_peer_connections[peer_id] = ci;
 		ci.dc.onopen = () => {
 			console.log('RTC INITIATOR 11/11 peer open - to '+peer_id, ci.dc);
@@ -305,7 +307,7 @@ class RtcBroker {
 			fwdmsg[5] = CODE_CLIENT_RTC_REQUEST;
 			fwdmsg.subarray(6,10).set(new Uint32Array([this.#client_id]));
 			fwdmsg.set(plainbytes, 10);
-			sock.send(fwdmsg);
+			this.#sock.send(fwdmsg);
 		};
 		//Once you call setLocalDescription(offer) all the ices will fill up then the promise will resolve
 		peer.createOffer().then(offer => peer.setLocalDescription(offer).then(() => {

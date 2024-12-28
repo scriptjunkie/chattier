@@ -6,6 +6,8 @@ import { generate, encrypt_keys_with_password, decrypt_keys_with_password, wrap_
 const LOCAL_STORAGE_ENC_KEY_NAME = "chattier_encrypted_hidden_key";
 const LOCAL_STORAGE_KNOWN_SERVERS_NAME = "chattier_known_servers";
 
+const MIN_CONNECTIONS = 2; //try to always ensure this many connections
+
 const MESSAGE_SELF_ANNOUNCE = 0x11; //announce your pubkey and ID's
 const MESSAGE_KNOWN_KEYS_AND_LINKS = 0x12;
 const MESSAGE_NEW_LINK = 0x13;
@@ -56,6 +58,8 @@ class Note{
 	#my_peers;
 	#timeout;
 	#con_log_listener;
+	#debug_mode;
+	#recheck_timer;
 
 	constructor(){
 		this.#idx_links = []; //idx -> Set(nodeidx)
@@ -74,10 +78,16 @@ class Note{
 		this.#my_hidden_keys = null;
 		this.#my_peers = {}; //idx -> {server_id -> peer_int}
 		this.#con_log_listener = null;
+		this.#debug_mode = false;
+		this.#recheck_timer = null;
 		const server_cache_string = localStorage.getItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME);
 		this.#known_servers = (server_cache_string === null ? {} : JSON.parse(server_cache_string)); //url -> id
 		this.#timeout = setTimeout(() => this.#dosends(), PING_INTERVAL_MS); //send polls regularly
 		clog('timeout ', this.#timeout);
+	}
+
+	set_debug_mode(enabled){
+		this.#debug_mode=enabled;
 	}
 
 	async init(){
@@ -93,6 +103,24 @@ class Note{
 			const wsurl = seedservers[offsetIndex];
 			this.#get_or_set_server_id(wsurl); //will connect if it should
 		}
+		this.#recheck_timer = setInterval(()=>{ //but if they don't in a little bit, connect to one
+			const total_pending = Object.entries(this.#realms).map(a=>a[1].rtc.num_pending()).reduce((e,v)=>e+v); //sum all num_pending
+			if(total_pending + Object.keys(this.#my_peers).length < MIN_CONNECTIONS){
+				let validids = [];
+				for(let srvid in this.#realms){
+					for(let peer_int of this.#realms[srvid].rtc.known_clients()){
+						if(!this.#realms[srvid].rtc.has_link(peer_int) && peer_int != this.#my_ids[srvid]){
+							validids.push([srvid,peer_int]);
+						}
+					}
+				}
+				if(validids.length > 0){
+					console.log("Few open connections - attempting to force new connection");
+					const choice = random_choice(validids);
+					this.#realms[choice[0]].rtc.connectto(choice[1]);
+				}
+			}
+		}, 5000);
 	}
 
 	get_con_logs(idx){
@@ -175,6 +203,13 @@ class Note{
 			},
 			(message, peer_int)=>this.#handle_msg(message, server_id, peer_int), //onmessage
 			(peer_int)=>this.#handle_peer_close(server_id, peer_int), //onconnclose
+			(peer_int)=>{ //onnewclient
+				if (Math.random() < 2 / (1 + Object.keys(this.#my_peers).length)){ //new peer - connect with decreasing probability
+					this.#realms[server_id].rtc.connectto(peer_int);
+				} else {
+					console.log('Not trying to connect to new peer ',peer_int,'. We already have ',Object.keys(this.#my_peers).length);
+				}
+			},
 		);
 		this.#realms[server_id] = {rtc: broker, peer_int_to_idx: {}, queued: {}};
 	}
@@ -325,7 +360,9 @@ class Note{
 				this.#con_log_listener = null;
 			}
 		}else if(code === MESSAGE_DEBUG_CON_LOG_REQUEST){
-			this.#realms[server_id].rtc.send(peer_int, concat(new Uint8Array([MESSAGE_DEBUG_CON_LOG]), new TextEncoder().encode(JSON.stringify(myconlog))));
+			if(this.#debug_mode){
+				this.#realms[server_id].rtc.send(peer_int, concat(new Uint8Array([MESSAGE_DEBUG_CON_LOG]), new TextEncoder().encode(JSON.stringify(myconlog))));
+			}
 		}else if(code === MESSAGE_KNOWN_KEYS_AND_LINKS){
 			let num_keys;
 			[num_keys, message] = unpack(message);
