@@ -162,9 +162,6 @@ class Note{
 			(peer_int)=>{ // onnewconn
 				this.#newconn(peer_int, server_id);
 			},
-			(node_id)=>{ // onnode
-				//don't really do anything here
-			},
 			(peer_int)=>{ // onnodeexit
 				const full_node_id = make_id(server_id, peer_int);
 				if(full_node_id in this.#nodes){

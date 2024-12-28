@@ -1,4 +1,8 @@
 // RTC broker - automatically establishes a set of peer connections using a websocket broker
+import { random_choice } from './algorithms.js';
+
+const MIN_CONNECTIONS = 1; //try to always ensure this many connections
+
 const CODE_FULL_LIST = 1;
 const CODE_CLIENT_EXIT = 2;
 const CODE_CLIENT_RTC_REQUEST = 3;
@@ -12,31 +16,41 @@ class RtcBroker {
 	#pending_peer_connections;
 	#onstarted; 
 	#onnewconn;
-	#onnode;
 	#onnodeexit;
 	#onmessage;
 	#on_conn_close;
+	#recheck_timer;
+	#known_clients;
 	
-	constructor(wsurl, zone, onclose, onerror, onstarted, onnewconn, onnode, onnodeexit, onmessage, onconnclose) {
+	constructor(wsurl, zone, onclose, onerror, onstarted, onnewconn, onnodeexit, onmessage, onconnclose) {
 		this.#client_id = null;
 		this.#links = {};
 		this.#pending_peer_connections = {};
 		this.#onstarted = onstarted;
 		this.#onnewconn = onnewconn;
-		this.#onnode = onnode;
 		this.#onnodeexit = onnodeexit;
 		this.#onmessage = onmessage;
 		this.#on_conn_close = onconnclose;
+		this.#recheck_timer = null;
+		this.#known_clients = new Set();
 		console.log('connecting to ', wsurl);
 		//Now do the connection
 		zone=(zone && zone.length == 32 ? zone : '00000000000000000000000000000000');
 		let sock = new WebSocket(wsurl);
 		sock.onclose = e => {
 			console.log('websocket ',wsurl,' closing ',e);
+			if(this.#recheck_timer !== null){
+				clearInterval(this.#recheck_timer);
+				this.#recheck_timer = null;
+			}
 			onclose(e);
 		};
 		sock.onerror = e => {
 			console.log('websocket ',wsurl,' error ',e);
+			if(this.#recheck_timer !== null){
+				clearInterval(this.#recheck_timer);
+				this.#recheck_timer = null;
+			}
 			onerror(e);
 		};
 		sock.onopen = e => {
@@ -69,6 +83,7 @@ class RtcBroker {
 		const u8 = new Uint8Array(await msgevt.data.arrayBuffer());
 		if(u8[0] == CODE_CLIENT_ANNOUNCE){
 			const announced_int = new Uint32Array(u8.slice(1,5).buffer)[0];
+			this.#known_clients.add(announced_int);
 			if(this.#client_id === null){
 				this.#client_id = announced_int;
 				if(this.#onstarted)
@@ -78,8 +93,6 @@ class RtcBroker {
 			}else {
 				console.log('Not trying to connect to new peer ',announced_int,'. We already have ',Object.keys(this.#links).length);
 			}
-			if(this.#client_id !== announced_int && this.#onnode)
-				this.#onnode(announced_int);
 		}else if(u8[0] == CODE_CLIENT_RTC_REQUEST && u8.length > 5){
 			const peer_id = new Uint32Array(u8.slice(1,5).buffer)[0];
 			const rtcRequest = JSON.parse((new TextDecoder()).decode(u8.subarray(5)));
@@ -203,6 +216,7 @@ class RtcBroker {
 			}
 		}else if(u8[0] == CODE_CLIENT_EXIT && u8.length >= 5){//short-circuit close when server tells us
 			const peer_id = new Uint32Array(u8.slice(1,5).buffer)[0];//since ID can be immediately reused
+			this.#known_clients.delete(peer_id);
 			console.log('Client ',peer_id,' exited per server');
 			if(peer_id in this.#pending_peer_connections){
 				this.#pending_peer_connections[peer_id].rtcpc.close();
@@ -218,9 +232,22 @@ class RtcBroker {
 			}
 			if(this.#client_id !== peer_id && this.#onnodeexit)
 				this.#onnodeexit(peer_id);
-		}else if(u8[0] == CODE_FULL_LIST){
-			if(this.#onnode)
-			Array.from(new Uint32Array(u8.slice(1).buffer)).forEach(id=>this.#onnode(id)); //we don't try to reach out here; they should try to reach us
+		}else if(u8[0] == CODE_FULL_LIST){ //we don't want to reach out here; they should try to reach us
+			Array.from(new Uint32Array(u8.slice(1).buffer)).forEach((id) => this.#known_clients.add(id)); //put all known clients in our set
+			this.#recheck_timer = setInterval(()=>{ //but if they don't in a little bit, connect to one
+				if(Object.keys(this.#pending_peer_connections).length + Object.keys(this.#links).length < MIN_CONNECTIONS){
+					let validids = [];
+					 for(let id of this.#known_clients){
+						if(id !== this.#client_id && !(id in this.#links) && !(id in this.#pending_peer_connections)){
+							validids.push(id);
+						}
+					}
+					if(validids.length > 0){
+						console.log("Few open connections - attempting to force new connection");
+						this.#connectto(random_choice(validids), sock);
+					}
+				}
+			}, 5000);
 		}
 	}
 
