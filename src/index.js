@@ -412,7 +412,7 @@ class Note{
 		return random_choice(Array.from(this.#idx_links[this.#known_key_idxs[host_pk]]));
 	}
 
-	async #setup_my_forwards(){
+	async setup_my_forwards(){
 		if(this.#idx_links.length < 3 || this.#idx_links[this.#known_key_idxs[this.#my_keys.pubraw]].size < 2){
 			clog('not enough nodes to setup forwards');
 			return false;
