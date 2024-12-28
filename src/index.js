@@ -492,4 +492,4 @@ if(localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME) === null){
 	context.generate_keys().then(()=>context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
 }
 
-export { context };
+export { Note, context };
