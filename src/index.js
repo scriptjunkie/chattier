@@ -115,12 +115,12 @@ class Note{
 					}
 				}
 				if(validids.length > 0){
-					console.log("Few open connections - attempting to force new connection");
+					clog("Few open connections - attempting to force new connection");
 					const choice = random_choice(validids);
 					this.#realms[choice[0]].rtc.connectto(choice[1]);
 				}
 			}
-		}, 5000);
+		}, 5000 + Math.random()*1000);
 	}
 
 	get_con_logs(idx){
@@ -191,6 +191,7 @@ class Note{
 				this.#newconn(peer_int, server_id);
 			},
 			(peer_int)=>{ // onnodeexit
+				clog('onnodeexit', server_id, peer_int);
 				const full_node_id = make_id(server_id, peer_int);
 				if(full_node_id in this.#nodes){
 					const idx = this.#known_key_idxs[this.#nodes[full_node_id]];
@@ -205,9 +206,10 @@ class Note{
 			(peer_int)=>this.#handle_peer_close(server_id, peer_int), //onconnclose
 			(peer_int)=>{ //onnewclient
 				if (Math.random() < 2 / (1 + Object.keys(this.#my_peers).length)){ //new peer - connect with decreasing probability
+					clog("Trying to connect to",server_id,peer_int);
 					this.#realms[server_id].rtc.connectto(peer_int);
 				} else {
-					console.log('Not trying to connect to new peer ',peer_int,'. We already have ',Object.keys(this.#my_peers).length);
+					clog('Not trying to connect to new peer ',peer_int,'. We already have ',Object.keys(this.#my_peers).length);
 				}
 			},
 		);

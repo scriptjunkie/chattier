@@ -76,11 +76,26 @@ class RtcBroker {
 	}
 
 	//clear a closed connection
-	#clearConn(peer_id, message){
+	#clearConn(peer_id, message, startTime){
 		console.log(message, peer_id);
-		if(peer_id in this.#links) delete this.#links[peer_id];
-		if(peer_id in this.#pending_peer_connections) delete this.#pending_peer_connections[peer_id];
-		if(this.#on_conn_close) this.#on_conn_close(peer_id);
+		if(peer_id in this.#pending_peer_connections && this.#pending_peer_connections[peer_id].started === startTime){
+			delete this.#pending_peer_connections[peer_id];
+		}else if(peer_id in this.#links){
+			delete this.#links[peer_id];
+			if(this.#on_conn_close) this.#on_conn_close(peer_id);
+		}else{
+			console.log("wait, what happened here? Not the right one in pending or active?", startTime, peer_id in this.#pending_peer_connections);
+		}
+	}
+
+	#scheduleTrimPending(peer_id, started){
+		setTimeout(()=>{
+			if(peer_id in this.#pending_peer_connections && this.#pending_peer_connections[peer_id].started === started){
+				console.log('RTC TIMED OUT :-(');
+				this.#pending_peer_connections[peer_id].rtcpc.close();
+				delete this.#pending_peer_connections[peer_id];
+			}
+		},20000 + Math.random() * 1000);
 	}
 
 	//web socket message function
@@ -101,6 +116,23 @@ class RtcBroker {
 			const rtcRequest = JSON.parse((new TextDecoder()).decode(u8.subarray(5)));
 			console.log('RTC RESPONDER 1/8 CODE_CLIENT_RTC_REQUEST', rtcRequest, 'from', peer_id);
 			
+			while(peer_id in this.#pending_peer_connections){
+				console.log('already in pending_peer_connections with state of ', this.#pending_peer_connections[peer_id].rtcpc.connectionState, ' and ice connection state of ',this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState,' maybe learned new ICE option?');
+				if(typeof this.#pending_peer_connections[peer_id].ices === 'undefined'){
+					console.log("Simultaneous open. Something probably got stuck.");
+					if((new Date().getTime()) - this.#pending_peer_connections[peer_id].started > 5){
+						console.log("ours is a bit old, closing and re-starting with this one");
+						this.#pending_peer_connections[peer_id].rtcpc.close();
+						delete this.#pending_peer_connections[peer_id];
+						break;
+					}
+					return;
+				}else if(this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState !== 'connected'){
+					submitIces(this.#pending_peer_connections[peer_id].rtcpc, rtcRequest.connectToMePlz);
+				}
+				return; //DONE
+			}
+
 			let submitIces = (rtcpeerconn, ice_list) => {
 				for(let i = 0; i < ice_list.length; i++){
 					const icej = JSON.stringify(ice_list[i]);
@@ -111,20 +143,12 @@ class RtcBroker {
 					}
 				}
 			};
-				
-			if(peer_id in this.#pending_peer_connections){
-				console.log('already in pending_peer_connections with state of ', this.#pending_peer_connections[peer_id].rtcpc.connectionState, ' and ice connection state of ',this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState,' maybe learned new ICE option?');
-				if(typeof this.#pending_peer_connections[peer_id].ices === 'undefined'){
-					console.log("Simultaneous open. Something probably got stuck. Ignoring this one.");
-					return;
-				}else if(this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState !== 'connected'){
-					submitIces(this.#pending_peer_connections[peer_id].rtcpc, rtcRequest.connectToMePlz);
-				}
-				return; //DONE
-			}
+
 			//create connection with same stun server hopefully
 			let inboundPeerConn = new RTCPeerConnection({iceServers: [{urls:[iceserver]}]});
-			this.#pending_peer_connections[peer_id] = {rtcpc: inboundPeerConn, ices: {}};
+			const startTime = new Date().getTime();
+			this.#pending_peer_connections[peer_id] = {rtcpc: inboundPeerConn, ices: {}, started: startTime};
+			this.#scheduleTrimPending(peer_id, startTime);
 			inboundPeerConn.ondatachannel = dcevt => {
 				let chan = dcevt.channel;
 				console.log('RTC RESPONDER 7/8 inboundPeerConn ondatachannel', dcevt, peer_id);
@@ -136,11 +160,11 @@ class RtcBroker {
 						this.#onnewconn(peer_id); //do normal new connection
 				};
 				chan.onmessage = async e => this.#onmessage(e.data, peer_id);
-				chan.onclose = () => this.#clearConn(peer_id, 'Data channel inboundPeerConn closed');
+				chan.onclose = () => this.#clearConn(peer_id, 'Data channel inboundPeerConn closed', startTime);
 				chan.onclosing = () => console.log('Data channel inboundPeerConn closing', peer_id);
 				chan.onerror = (e) => this.#clearConn(peer_id, 'Data channel inboundPeerConn err '+JSON.stringify(e));
 			};
-			inboundPeerConn.onclose = () => this.#clearConn(peer_id, 'inboundPeerConn closed');
+			inboundPeerConn.onclose = () => this.#clearConn(peer_id, 'inboundPeerConn closed', startTime);
 			let inboundIces = [];
 			let answerReady = false;
 			let completed = false;
@@ -165,7 +189,7 @@ class RtcBroker {
 			inboundPeerConn.onconnectionstatechange = () => {
 				console.log('inboundPeerConn onconnectionstatechange',peer_id,inboundPeerConn.connectionState); //'failed' if it dies
 				if(inboundPeerConn.connectionState === 'failed' || inboundPeerConn.connectionState === 'disconnected'){
-					this.#clearConn(peer_id, 'inboundPeerConn ' + inboundPeerConn.connectionState);
+					this.#clearConn(peer_id, 'inboundPeerConn ' + inboundPeerConn.connectionState, startTime);
 				}else if(inboundPeerConn.connectionState === 'connected'){
 					completer(false);
 				}
@@ -266,14 +290,9 @@ class RtcBroker {
 		}
 		console.log('RTC INITIATOR 1/11 seeking to open peer to '+peer_id); 
 		let peer = new RTCPeerConnection({iceServers: [{urls:[iceserver]}]});
-		let ci = {rtcpc: peer, dc: peer.createDataChannel('peerchan'), started: new Date().getTime(), last: new Date().getTime()};
-		setTimeout(()=>{
-			if(peer_id in this.#pending_peer_connections && this.#pending_peer_connections[peer_id].started === ci.started){
-				console.log('RTC INITIATOR TIMED OUT :-(');
-				delete this.#pending_peer_connections[peer_id];
-				ci.rtcpc.close();
-			}
-		},20000);
+		const startTime = new Date().getTime();
+		let ci = {rtcpc: peer, dc: peer.createDataChannel('peerchan'), started: startTime, last: startTime};
+		this.#scheduleTrimPending(peer_id, startTime);
 		this.#pending_peer_connections[peer_id] = ci;
 		ci.dc.onopen = () => {
 			console.log('RTC INITIATOR 11/11 peer open - to '+peer_id, ci.dc);
@@ -285,12 +304,12 @@ class RtcBroker {
 		ci.dc.onmessage = async e => this.#onmessage(e.data, peer_id);
 		ci.dc.onclose = () => {
 			peer.close();
-			this.#clearConn(peer_id, 'peer dc closed');
+			this.#clearConn(peer_id, 'peer dc closed', startTime);
 		};
 		ci.dc.onclosing = () => console.log('Peer data channel closing', peer_id);
 		ci.dc.onerror = (e) => {
 			peer.close();
-			this.#clearConn(peer_id, 'Peer data channel err '+JSON.stringify(e));
+			this.#clearConn(peer_id, 'Peer data channel err '+JSON.stringify(e), startTime);
 		};
 		let ices = [];
 		let offerReady = false;
@@ -335,14 +354,14 @@ class RtcBroker {
 			else
 				console.log('peer signaling state change', peer.signalingState, peer_id)
 		};
-		peer.onclose = () => this.#clearConn(peer_id, 'peer RTC close');
+		peer.onclose = () => this.#clearConn(peer_id, 'peer RTC close', startTime);
 		peer.onconnectionstatechange = () => {
 			if(peer.connectionState === 'connecting')
 				console.log('RTC INITIATOR 9/11 peer onconnectionstatechange',peer.connectionState);
 			else if(peer.connectionState === 'connected')
 				console.log('RTC INITIATOR 10/11 peer onconnectionstatechange',peer.connectionState);
 			else if(peer.connectionState === 'failed' || peer.connectionState === 'disconnected'){
-				this.#clearConn(peer_id, 'RTC INITIATOR Peer connection failed or disconnected');
+				this.#clearConn(peer_id, 'RTC INITIATOR Peer connection failed or disconnected', startTime);
 			}else
 				console.log('RTC INITIATOR peer onconnectionstatechange',peer.connectionState);
 		};
