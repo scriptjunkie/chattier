@@ -74,7 +74,7 @@ async function seal_to(plainbytes, public_raw){
 }
 
 async function unseal(sealed, privateKey){
-	let pub_keyraw, ciphertext_iv, ciphertext;
+	let pub_keyraw, ciphertext_iv, iv, ciphertext;
 	[pub_keyraw, ciphertext_iv] = splice(sealed, KEY_LENGTH);
 	[iv, ciphertext] = splice(ciphertext_iv, 16);
 	const publicKey = await crypto.subtle.importKey('raw', pub_keyraw, { name: 'ECDH', namedCurve: 'P-256'}, true, []);

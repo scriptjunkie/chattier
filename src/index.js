@@ -20,6 +20,8 @@ const MESSAGE_LOST_LINK = 0x19;
 const MESSAGE_DEBUG_CON_LOG_REQUEST = 0x20;
 const MESSAGE_DEBUG_CON_LOG = 0x21;
 
+const SETUP_FORWARD_INNER = 0xA1;
+
 const ROUTE_LENGTH = 3; //default hops to a node
 const PING_LENGTH = 1400; //length of a ping
 const PING_INTERVAL_MS = 2000;
@@ -162,7 +164,7 @@ class Note{
 					clog('sending forward to ', server_id,' ',peer_id);
 					let to_send = realm.queued[peer_id].splice(0,1)[0];
 					let packed_inner_length = pack(to_send.length);
-					let buf = concat(new Uint8Array[MESSAGE_PADDED], packed_inner_length, to_send, new Uint8Array(PING_LENGTH - 1 - to_send.length));
+					let buf = concat(new Uint8Array([MESSAGE_PADDED]), packed_inner_length, to_send, new Uint8Array(PING_LENGTH - 1 - to_send.length));
 					realm.rtc.send(peer_id, buf); // do send of queued, padded to PING_LENGTH
 				} else { //send junk
 					let ping = new Uint8Array(PING_LENGTH);
@@ -203,7 +205,7 @@ class Note{
 					delete this.#nodes[full_node_id];
 				}
 			},
-			(message, peer_int)=>this.#handle_msg(message, server_id, peer_int), //onmessage
+			(message, peer_int)=>this.#wrapped_handle_msg(message, server_id, peer_int), //onmessage
 			(peer_int)=>this.#handle_peer_close(server_id, peer_int), //onconnclose
 			(peer_int)=>{ //onnewclient
 				if (Math.random() < 2 / (1 + Object.keys(this.#my_peers).length)){ //new peer - connect with decreasing probability
@@ -218,6 +220,7 @@ class Note{
 	}
 
 	#handle_peer_close(server_id, peer_int){
+		if(peer_int in this.#realms[server_id]) delete this.#realms[server_id].queued[peer_int];
 		//clear node aliases
 		const full_node_id = make_id(server_id, peer_int);
 		if(full_node_id in this.#nodes){
@@ -238,6 +241,7 @@ class Note{
 	#set_node_pubkey(server_peer_id, pubkeyraw){
 		this.#nodes[server_peer_id] = b64encode(pubkeyraw);
 		let their_idx = this.#nodeidx_for_pubkey(pubkeyraw);
+		if(!(their_idx in this.#known_aliases)) this.#known_aliases[their_idx] = new Set();
 		this.#known_aliases[their_idx].add(server_peer_id); //nodeid -> server/peer ints id
 		return their_idx;
 	}
@@ -317,6 +321,15 @@ class Note{
 		this.#realms[server_id].rtc.send(peer_id, keys_and_links);
 	}
 
+	//handles a peer message with error loggin
+	async #wrapped_handle_msg(message_data, server_id, peer_int){
+		try{
+			return this.#handle_msg(message_data, server_id, peer_int);
+		}catch(e){
+			clog('ERROR line',e.lineNumber,'message',e.message,'fileName',e.fileName,'stack',e.stack);
+		}
+	}
+
 	//handles a peer message
 	async #handle_msg(message_data, server_id, peer_int){
 		if(message_data instanceof Blob){
@@ -335,6 +348,7 @@ class Note{
 				this.#my_peers[their_idx] = {};
 			}
 			this.#my_peers[their_idx][server_id] = peer_int;
+			if(!(peer_int in this.#realms[server_id].queued)) this.#realms[server_id].queued[peer_int] = [];
 			this.#realms[server_id].peer_int_to_idx[peer_int] = their_idx;
 			let their_server_id_to_ours = {};
 			while(message.length > 0){
@@ -407,19 +421,15 @@ class Note{
 				return;
 			}
 			let next_nodeid = this.#known_key_idxs[next_b64];
-			for(let server_peer_id of this.#known_aliases[next_nodeid]){ //alias e.g. "1_4"
-				let [server_id, peer_id] = server_peer_id.split('_').map(f=>parseInt(f));
-				let realm = this.#realms[server_id]; //TODO: make this faster by caching next hops
-				const peers = realm.peers();
-				for(let i = 0; i < peers.length; i++){
-					const candidate_peer_id = peers[i];
-					if(candidate_peer_id === peer_id){
-						clog('Queueing forward to ', next_b64, ' (',server_id,'_',peer_id,')'); //here's our stop!
-						if(!(peer_id in realm.queued)) realm.queued[peer_id] = [];
-						realm.queued[peer_id].push(message);
+			if(next_nodeid in this.#my_peers){
+				for(let server_peer_id in this.#my_peers[next_nodeid]){
+					if(this.#my_peers[next_nodeid][server_peer_id] in this.#realms[server_id]){
+							clog('Queueing forward to ', next_b64, ' (',server_peer_id,'_',this.#my_peers[next_nodeid][server_peer_id],')'); //here's our stop!
+						this.#realms[server_id].queued[this.#my_peers[next_nodeid][server_peer_id]].push(message);
 						return;
 					}
 				}
+				clog("WARNING: Peer without valid queue?",next_nodeid);
 			}
 			clog('WARNING: next hop '+next_b64+' not direct link - dropping message');
 		}else if(code === MESSAGE_PADDED){
@@ -427,21 +437,24 @@ class Note{
 			[inner_length, message] = unpack(message);
 			return this.#handle_msg(message.subarray(0,inner_length), server_id, peer_int); //unpad and recurse
 		}else if(code === MESSAGE_SEALED){
-			return this.#handle_msg(unseal(message, this.#my_keys.ecdh.privateKey), server_id, peer_int); //unseal and recurse
+			clog("Unsealing", code, 'len', message.length);
+			return this.#handle_msg(await unseal(message, this.#my_keys.ecdh.privateKey), server_id, peer_int); //unseal and recurse
 		}else if(code === MESSAGE_SETUP_FORWARD){
 			let next_hop, next_keyraw, sig, next_wrap;
 			[next_keyraw, message] = splice(message, KEY_LENGTH);
 			let next_key = await crypto.subtle.importKey('raw', next_keyraw, {name: 'ECDSA', namedCurve: 'P-256'}, true, ['verify']);
 			[sig, message] = splice(message, SIG_LENGTH);
-			if(await verify(message, sig, next_key) && message[0] === MESSAGE_SETUP_FORWARD){
+			if(await verify(message, sig, next_key) && message[0] === SETUP_FORWARD_INNER){
+				[code, message] = splice(message, 1);
 				[next_hop, message] = splice(message, KEY_LENGTH);
 				[next_wrap, message] = splice(message, KEY_LENGTH);
 				this.#my_forwards[b64encode(next_keyraw)] = [next_hop, next_wrap]; //key -> next_hop_key, next_wrapping_key
+				clog('Set up forward for messages to go to',this.#known_key_idxs[b64encode(next_hop)]);
 			}else{
 				clog('WARNING: bad forward setup?');
 			}
 		}else if(code !== MESSAGE_PING){
-			clog('unknown message ', message);
+			clog('unknown message ', message,'len',message.length, 'vals', message.subarray(0,6).join(','));
 		}
 	}
 
@@ -463,16 +476,16 @@ class Note{
 		for(let i = 0; i < num_hops; i++){
 			const keys = await generate(); //make some intermediate keys
 			if(i > 0){ //every hop except the last one (us), set up the forward
-				//tell host when they get a message for keys.pubraw, wrap it to keys.pubraw and send to previous host addressed to previous keys.pubraw
+				//tell host when they get a message for keys.pubraw, wrap it to next keys.pubraw and send to next host
 				const last_hop_key_raw = this.#known_keys[this.#my_forward_chain[i - 1].host_idx];
-				const inner = concat(new Uint8Array([MESSAGE_SETUP_FORWARD]), last_hop_key_raw, this.#my_forward_chain[i - 1].keys.pubraw);
+				const inner = concat(new Uint8Array([SETUP_FORWARD_INNER]), last_hop_key_raw, this.#my_forward_chain[i - 1].keys.pubraw);
 				const signature = await sign(inner, keys.ecdsa.privateKey);
 				rand_route_indexed.push(host_idx);
 				this.#send_wrapped_with_route(rand_route_indexed, concat(new Uint8Array([MESSAGE_SETUP_FORWARD]), keys.pubraw, signature, inner));
+				clog('setting up forward '+i+':',host_idx,'->',rand_route_indexed[i-1],'=',this.#my_forward_chain[i - 1].host_idx,'next hop key',b64encode(last_hop_key_raw));
 			}
 			this.#my_forward_chain.push({host_idx, keys, link_pubkey: keys.pub64});
 			host_idx = this.#pick_random_neighbor(host_idx); //pick a host
-			clog('Setting up forward',i,':',host_idx,'->',rand_route_indexed[rand_route_indexed.length-1]);
 		}
 		return true;
 	}
@@ -486,24 +499,26 @@ class Note{
 		return this.#send_wrapped_with_route(rand_route_indexed, messagebuffer);
 	}
 
-	async #send_wrapped_with_route(rand_route_indexed, messagebuffer){
-		clog("Sending wrapped over route",rand_route_indexed);
+	async #send_wrapped_with_route(route, messagebuffer){
+		//wrap message to destination
+		messagebuffer = concat(new Uint8Array([MESSAGE_SEALED]), await seal_to(messagebuffer, this.#known_keys[route[route.length - 1]]));
 		//Successively wrap messages to target
-		for(let i = rand_route_indexed.length - 1; i > 0; i--){
-			const hop = this.#known_keys[rand_route_indexed[i]];
-			const sealed_to_last = concat(new Uint8Array([MESSAGE_SEALED]), await seal_to(messagebuffer, hop));
+		for(let i = route.length - 2; i > 0; i--){
+			const hop = this.#known_keys[route[i]];
 			messagebuffer = concat(new Uint8Array([MESSAGE_FWD]), hop, sealed_to_last);
+			if(i > 0) messagebuffer = concat(new Uint8Array([MESSAGE_SEALED]), await seal_to(messagebuffer, hop));
 		}
 
 		//find server_id and peer_id that go to next hop and queue it to send
-		for(let server_peer_id of this.#known_aliases[rand_route_indexed[1]]){ //e.g. server_peer_id = "1_4"
+		for(let server_peer_id of this.#known_aliases[route[1]]){ //e.g. server_peer_id = "1_4"
 			let [server_id, peer_id] = server_peer_id.split('_').map(f=>parseInt(f));
 			if(server_id in this.#realms && peer_id in this.#realms[server_id].queued){
 				clog('queuing relayed send to '+server_peer_id);
-				this.#realms[server_id].queued[peer_id].push(sealed_to_hop);
-				break;
+				this.#realms[server_id].queued[peer_id].push(messagebuffer);
+				return;
 			}
 		}
+		clog("ERROR - no known alias for",route[1]);
 	}
 
 	//look up or get and store server ID
