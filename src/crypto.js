@@ -1,4 +1,4 @@
-import { b64encode, b64decode, splice } from './bits.js';
+import { b64encode, b64decode, splice, concat } from './bits.js';
 const KEY_LENGTH = 65;
 
 async function decrypt_keys_with_password(encryptedKey, password){
@@ -22,8 +22,8 @@ async function decrypt_keys_with_password(encryptedKey, password){
 	delete ecdh_priv_jwk['d'];
 	ecdh_priv_jwk['key_ops']=['verify'];
 	let ecdsa_pubkey = await crypto.subtle.importKey('jwk', ecdh_priv_jwk, {name: 'ECDSA', namedCurve: 'P-256'}, true, ['verify']);
-	const pubraw = await crypto.subtle.exportKey('raw', ecdsa_pubkey);//my pub key as arraybuffer
-	const pub64 = b64encode(new Uint8Array(pubraw));
+	const pubraw = new Uint8Array(await crypto.subtle.exportKey('raw', ecdsa_pubkey));//my pub key as arraybuffer
+	const pub64 = b64encode(pubraw);
 	return {ecdh: {privateKey: ecdh_privkey, publicKey: ecdh_pubkey}, ecdsa: {privateKey: ecdsa_privkey, publicKey: ecdsa_pubkey}, pubraw, pub64};
 }
 
@@ -47,8 +47,8 @@ async function generate(){
 	delete ecdh_priv_jwk['d'];
 	ecdh_priv_jwk['key_ops']=['verify'];
 	const ecdsa_pubkey = await crypto.subtle.importKey('jwk', ecdh_priv_jwk, {name: 'ECDSA', namedCurve: 'P-256'}, true, ['verify']);
-	const pubraw = await crypto.subtle.exportKey('raw', ecdsa_pubkey);//my pub key as arraybuffer
-	const pub64 = b64encode(new Uint8Array(pubraw));
+	const pubraw = new Uint8Array(await crypto.subtle.exportKey('raw', ecdsa_pubkey));//my pub key as Uint8Array
+	const pub64 = b64encode(pubraw);
 	return {ecdh: ecdh_keypair, ecdsa: {privateKey: ecdsa_privkey, publicKey: ecdsa_pubkey}, pubraw, pub64};
 }
 
@@ -68,16 +68,16 @@ async function wrap_to(plainbytes, publicKey, privateKey){
 //seals to a given pubkey by generating a random keypair and wrapping to the pubkey with it.
 async function seal_to(plainbytes, public_raw){
 	const ecdh_keypair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256'}, true, ['deriveBits']);
-	const pk = await crypto.subtle.exportKey('raw', ecdh_keypair.publicKey);
-	const imported_pub = await crypto.subtle.importKey('raw', public_raw, {name: 'ECDH', namedCurve: 'P-256'}, true, ['deriveBits']);
-	return new Uint8Array(await (new Blob([pk, await wrap_to(plainbytes, imported_pub, ecdh_keypair.privateKey)])).arrayBuffer());
+	const pk = new Uint8Array(await crypto.subtle.exportKey('raw', ecdh_keypair.publicKey));
+	const imported_pub = await crypto.subtle.importKey('raw', public_raw, {name: 'ECDH', namedCurve: 'P-256'}, true, []);
+	return concat(pk, await wrap_to(plainbytes, imported_pub, ecdh_keypair.privateKey));
 }
 
 async function unseal(sealed, privateKey){
 	let pub_keyraw, ciphertext_iv, ciphertext;
 	[pub_keyraw, ciphertext_iv] = splice(sealed, KEY_LENGTH);
 	[iv, ciphertext] = splice(ciphertext_iv, 16);
-	const publicKey = await crypto.subtle.importKey('raw', pub_keyraw, { name: 'ECDH', namedCurve: 'P-256'}, true, ['deriveBits']);
+	const publicKey = await crypto.subtle.importKey('raw', pub_keyraw, { name: 'ECDH', namedCurve: 'P-256'}, true, []);
 	const sharedsecret = await shared_secret(publicKey, privateKey);
 	return new Uint8Array(await crypto.subtle.decrypt({ name: 'aes-gcm', iv: iv }, sharedsecret, ciphertext));
 }

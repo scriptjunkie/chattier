@@ -84,7 +84,7 @@ class RtcBroker {
 			delete this.#links[peer_id];
 			if(this.#on_conn_close) this.#on_conn_close(peer_id);
 		}else{
-			console.log("wait, what happened here? Not the right one in pending or active?", startTime, peer_id in this.#pending_peer_connections);
+			console.log("Orphaned session cleared", peer_id, startTime, peer_id in this.#pending_peer_connections);
 		}
 	}
 

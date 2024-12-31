@@ -20,6 +20,7 @@ const MESSAGE_LOST_LINK = 0x19;
 const MESSAGE_DEBUG_CON_LOG_REQUEST = 0x20;
 const MESSAGE_DEBUG_CON_LOG = 0x21;
 
+const ROUTE_LENGTH = 3; //default hops to a node
 const PING_LENGTH = 1400; //length of a ping
 const PING_INTERVAL_MS = 2000;
 const SIG_LENGTH = 64;
@@ -63,7 +64,7 @@ class Note{
 
 	constructor(){
 		this.#idx_links = []; //idx -> Set(nodeidx)
-		this.#known_keys = []; //idx -> pubkey64
+		this.#known_keys = []; //idx -> pubkeyraw
 		this.#known_aliases = []; //idx -> Set(node_id)
 		this.#known_key_idxs = {}; //pubkey64 -> idx
 		this.#nodes = {}; //node_id -> pubkey64
@@ -92,7 +93,7 @@ class Note{
 
 	async init(){
 		this.#my_keys = await generate();
-		this.#nodeidx_for_pubkey(this.#my_keys.pub64); //set us as idx 0.
+		this.#nodeidx_for_pubkey(this.#my_keys.pubraw); //set us as idx 0.
 		clog('my node key ', this.#my_keys.pub64);
 		const offset = crypto.getRandomValues(new Uint32Array(1))[0] % seedservers.length;
 		for(let wsurl in this.#known_servers){
@@ -183,7 +184,7 @@ class Note{
 			()=>{clog('ducky');}, // onerror
 			(client_id)=>{ // onstarted
 				clog('MY ID on ', server_id, ' IS ', client_id);
-				this.#set_node_pubkey(make_id(server_id, client_id), this.#my_keys.pub64);
+				this.#set_node_pubkey(make_id(server_id, client_id), this.#my_keys.pubraw);
 				this.#my_ids[server_id] = client_id;
 				localStorage.setItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME, JSON.stringify(this.#known_servers));
 			},
@@ -234,17 +235,18 @@ class Note{
 	}
 
 	//Notes a server/peer ID is a given pubkey and returns the idx
-	#set_node_pubkey(server_peer_id, pub64){
-		this.#nodes[server_peer_id] = pub64;
-		let their_idx = this.#nodeidx_for_pubkey(pub64);
+	#set_node_pubkey(server_peer_id, pubkeyraw){
+		this.#nodes[server_peer_id] = b64encode(pubkeyraw);
+		let their_idx = this.#nodeidx_for_pubkey(pubkeyraw);
 		this.#known_aliases[their_idx].add(server_peer_id); //nodeid -> server/peer ints id
 		return their_idx;
 	}
 
-	#nodeidx_for_pubkey(pub64) {
+	#nodeidx_for_pubkey(pubkeyraw) {
+		const pub64 = b64encode(pubkeyraw)
 		if(!(pub64 in this.#known_key_idxs)){ //newly known node!
 			this.#known_key_idxs[pub64] = this.#known_keys.length;
-			this.#known_keys.push(pub64); // nodeid -> key64
+			this.#known_keys.push(pubkeyraw); // nodeid -> key64
 			this.#known_aliases.push(new Set());
 			this.#idx_links.push(new Set());
 		}
@@ -264,7 +266,7 @@ class Note{
 	#note_known_link(alice_idx, bob_idx, reporter_idx){
 		if(this.#idx_links[alice_idx].has(bob_idx)) return;
 		clog('Adding new link '+alice_idx+' <-> '+bob_idx, reporter_idx);
-		let message = concat(new Uint8Array([MESSAGE_NEW_LINK]), b64decode(this.#known_keys[alice_idx]), b64decode(this.#known_keys[bob_idx]));
+		let message = concat(new Uint8Array([MESSAGE_NEW_LINK]), this.#known_keys[alice_idx], this.#known_keys[bob_idx]);
 		this.#send_all_peers(message, reporter_idx, alice_idx, bob_idx); //send announcement to all peers
 		this.#idx_links[alice_idx].add(bob_idx);
 		this.#idx_links[bob_idx].add(alice_idx);
@@ -273,7 +275,7 @@ class Note{
 	#forget_known_link(alice_idx, bob_idx, reporter_idx){
 		if(!this.#idx_links[alice_idx].has(bob_idx)) return;
 		clog('FORGETTING lost link '+alice_idx+' <-> '+bob_idx);
-		let message = concat(new Uint8Array([MESSAGE_LOST_LINK]), b64decode(this.#known_keys[alice_idx]), b64decode(this.#known_keys[bob_idx]));
+		let message = concat(new Uint8Array([MESSAGE_LOST_LINK]), this.#known_keys[alice_idx], this.#known_keys[bob_idx]);
 		this.#send_all_peers(message, reporter_idx, alice_idx, bob_idx); //send announcement to all peers
 		this.#idx_links[alice_idx].delete(bob_idx);
 		this.#idx_links[bob_idx].delete(alice_idx);
@@ -301,9 +303,7 @@ class Note{
 		// Send known keys and links by nodeid
 		let known_keys_and_links_chunks = [new Uint8Array([MESSAGE_KNOWN_KEYS_AND_LINKS])];
 		known_keys_and_links_chunks.push(pack(this.#known_keys.length));
-		for(let key of this.#known_keys){
-			known_keys_and_links_chunks.push(b64decode(key));
-		}
+		this.#known_keys.forEach(key => known_keys_and_links_chunks.push(key));
 		for(let src = 0; src < this.#idx_links.length; src++){
 			for(let dst of this.#idx_links[src]){
 				if(src < dst){ // only do one direction, a->b, not b->a
@@ -328,8 +328,7 @@ class Note{
 		if(code === MESSAGE_SELF_ANNOUNCE){
 			let pubk;
 			[pubk, message] = splice(message, KEY_LENGTH);
-			const peer_b64 = b64encode(pubk);
-			const their_idx = this.#set_node_pubkey(make_id(server_id, peer_int), peer_b64); //this makes them a new node if not known before
+			const their_idx = this.#set_node_pubkey(make_id(server_id, peer_int), pubk); //this makes them a new node if not known before
 			clog('self announce from '+server_id+'_'+peer_int+' which is now ID '+their_idx);
 			this.#note_known_link(0, their_idx, their_idx); //save the link. We're always 0
 			if(!(their_idx in this.#my_peers)){
@@ -354,7 +353,7 @@ class Note{
 				[their_server_id, message] = unpack(message);
 				[their_client_id, message] = unpack(message);
 				clog("peer's alias ", their_server_id, ' (',their_server_id_to_ours[their_server_id],') ', their_client_id);
-				this.#set_node_pubkey(make_id(their_server_id_to_ours[their_server_id], their_client_id), peer_b64);
+				this.#set_node_pubkey(make_id(their_server_id_to_ours[their_server_id], their_client_id), pubk);
 			}
 		}else if(code === MESSAGE_DEBUG_CON_LOG){
 			if(this.#con_log_listener){
@@ -372,9 +371,8 @@ class Note{
 			for(let i = 0; i < num_keys; i++){
 				let pubk;
 				[pubk, message] = splice(message, KEY_LENGTH);
-				const pubk64 = b64encode(pubk);
-				their_nodeid_to_ours[i] = this.#nodeidx_for_pubkey(pubk64);
-				clog('received note of key ',pubk64,' - node ', this.#nodeidx_for_pubkey(pubk64), 'from', their_nodeid_to_ours[0]);
+				their_nodeid_to_ours[i] = this.#nodeidx_for_pubkey(pubk);
+				clog('received note of key ',b64encode(pubk),' - node ', this.#nodeidx_for_pubkey(pubk), 'from', their_nodeid_to_ours[0]);
 			}
 			const their_idx = their_nodeid_to_ours[0]; //Get their idx
 			while(message.length > 0){
@@ -384,15 +382,15 @@ class Note{
 				const our_src_id = their_nodeid_to_ours[src_their_nodeid];
 				const our_dst_id = their_nodeid_to_ours[dst_their_nodeid];
 				clog('received note of link ',our_src_id,' -> ', our_dst_id);
-				this.#note_known_link(our_src_id, our_dst_id, their_idx); //save the link
+				if(our_src_id !== 0 && our_dst_id !== 0) this.#note_known_link(our_src_id, our_dst_id, their_idx); //save the link. But don't trust our links
 			}
 		}else if(code === MESSAGE_NEW_LINK){ //Just src, dst keys
-			const arr = splice(message, KEY_LENGTH).map(a=>this.#nodeidx_for_pubkey(b64encode(a)));
+			const arr = splice(message, KEY_LENGTH).map(a=>this.#nodeidx_for_pubkey(a));
 			clog("MESSAGE_NEW_LINK", arr[0], arr[1], 'from', server_id+'_'+peer_int);
 			const their_idx = this.#realms[server_id].peer_int_to_idx[peer_int]; // this should be set by now
 			this.#note_known_link(arr[0], arr[1], their_idx);
 		}else if(code === MESSAGE_LOST_LINK){ //Just src, dst keys. TODO: sign this
-			const arr = splice(message, KEY_LENGTH).map(a=>this.#nodeidx_for_pubkey(b64encode(a)));
+			const arr = splice(message, KEY_LENGTH).map(a=>this.#nodeidx_for_pubkey(a));
 			clog("MESSAGE_LOST_LINK", arr[0], arr[1], 'from', server_id+'_'+peer_int);
 			const their_idx = this.#realms[server_id].peer_int_to_idx[peer_int]; // this should be set by now
 			this.#forget_known_link(arr[0], arr[1], their_idx);
@@ -447,47 +445,53 @@ class Note{
 		}
 	}
 
-	#pick_random_neighbor(host_pk) {
-		return random_choice(Array.from(this.#idx_links[this.#known_key_idxs[host_pk]]));
+	//returns a random idx of a node linked to host_idx
+	#pick_random_neighbor(host_idx) {
+		return random_choice(Array.from(this.#idx_links[host_idx]));
 	}
 
 	async setup_my_forwards(){
-		if(this.#idx_links.length < 3 || this.#idx_links[this.#known_key_idxs[this.#my_keys.pubraw]].size < 2){
+		if(this.#idx_links.length < 3 || this.#idx_links[0].size < 2){
 			clog('not enough nodes to setup forwards');
 			return false;
 		}
 		//pick several hops (2 for now, if we can find them) and generate a key for each.
 		const num_hops = 2;
 		this.#my_forward_chain = [];
-		let host = this.#my_keys.pubraw; //us
+		let host_idx = 0;// this.#my_keys.pubraw; //us
+		let rand_route_indexed = [0];
 		for(let i = 0; i < num_hops; i++){
-			const keys = generate(); //make some intermediate keys
-			const key_raw = await crypto.subtle.exportKey('raw', keys.publicKey);
+			const keys = await generate(); //make some intermediate keys
 			if(i > 0){ //every hop except the last one (us), set up the forward
-				//tell host when they get a message for key_raw, wrap it to key_raw and send to previous host addressed to previous key_raw
-				const inner = concat(new Uint8Array([MESSAGE_SETUP_FORWARD]), this.#my_forward_chain[i - 1].host, this.#my_forward_chain[i - 1].key_raw);
-				const signature = sign(inner, keys.privateKey);
-				this.#send_wrapped_routed(host, concat(new Uint8Array([MESSAGE_SETUP_FORWARD]), key_raw, signature, inner));
+				//tell host when they get a message for keys.pubraw, wrap it to keys.pubraw and send to previous host addressed to previous keys.pubraw
+				const last_hop_key_raw = this.#known_keys[this.#my_forward_chain[i - 1].host_idx];
+				const inner = concat(new Uint8Array([MESSAGE_SETUP_FORWARD]), last_hop_key_raw, this.#my_forward_chain[i - 1].keys.pubraw);
+				const signature = await sign(inner, keys.ecdsa.privateKey);
+				rand_route_indexed.push(host_idx);
+				this.#send_wrapped_with_route(rand_route_indexed, concat(new Uint8Array([MESSAGE_SETUP_FORWARD]), keys.pubraw, signature, inner));
 			}
-			this.#my_forward_chain.push({host, keys, key_raw});
-			host = this.#pick_random_neighbor(host); //pick a host
+			this.#my_forward_chain.push({host_idx, keys, link_pubkey: keys.pub64});
+			host_idx = this.#pick_random_neighbor(host_idx); //pick a host
+			clog('Setting up forward',i,':',host_idx,'->',rand_route_indexed[rand_route_indexed.length-1]);
 		}
 		return true;
 	}
 
 	//Sends a message over the network in a metadata-hiding wrapped way by selecting one or more intermediate hops
 	async #send_wrapped_routed(host, messagebuffer){
-		let host64 = b64encode(host);
-		const my_idx = this.#nodeidx_for_pubkey(this.#my_keys.pub64);
-		const their_idx = this.#nodeidx_for_pubkey(host64);
+		const my_idx = 0;
+		const their_idx = this.#nodeidx_for_pubkey(host);
 		//First find random route as indexed array
-		const ROUTE_LENGTH = 3;
 		const rand_route_indexed = find_route_of_length(my_idx, ROUTE_LENGTH, their_idx, this.#idx_links);
-		
+		return this.#send_wrapped_with_route(rand_route_indexed, messagebuffer);
+	}
+
+	async #send_wrapped_with_route(rand_route_indexed, messagebuffer){
+		clog("Sending wrapped over route",rand_route_indexed);
 		//Successively wrap messages to target
 		for(let i = rand_route_indexed.length - 1; i > 0; i--){
 			const hop = this.#known_keys[rand_route_indexed[i]];
-			const sealed_to_last = concat(new Uint8Array([MESSAGE_SEALED]), seal_to(messagebuffer, hop));
+			const sealed_to_last = concat(new Uint8Array([MESSAGE_SEALED]), await seal_to(messagebuffer, hop));
 			messagebuffer = concat(new Uint8Array([MESSAGE_FWD]), hop, sealed_to_last);
 		}
 
