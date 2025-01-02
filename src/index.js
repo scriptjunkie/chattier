@@ -1,5 +1,5 @@
 import { pack, unpack, b64encode, b64decode, splice, concat } from './bits.js';
-import { random_choice, random_path, find_route_of_length } from './algorithms.js';
+import { random_choice, random_path, find_route_of_length, shortest_path } from './algorithms.js';
 import { RtcBroker } from './rtcbroker.js';
 import { generate, encrypt_keys_with_password, decrypt_keys_with_password, wrap_to, seal_to, unseal, sign, verify } from './crypto.js';
 
@@ -17,6 +17,8 @@ const MESSAGE_PADDED = 0x16;
 const MESSAGE_SETUP_FORWARD = 0x17; //set up or tear down forward
 const MESSAGE_SEALED = 0x18; //encrypted
 const MESSAGE_LOST_LINK = 0x19;
+const MESSAGE_ANNOUNCE = 0x1A; //announce another host
+
 const MESSAGE_DEBUG_CON_LOG_REQUEST = 0x20;
 const MESSAGE_DEBUG_CON_LOG = 0x21;
 
@@ -424,7 +426,7 @@ class Note{
 			if(next_nodeid in this.#my_peers){
 				for(let server_peer_id in this.#my_peers[next_nodeid]){
 					if(this.#my_peers[next_nodeid][server_peer_id] in this.#realms[server_id]){
-							clog('Queueing forward to ', next_b64, ' (',server_peer_id,'_',this.#my_peers[next_nodeid][server_peer_id],')'); //here's our stop!
+						clog('Queueing forward to ', next_b64, ' (',server_peer_id,'_',this.#my_peers[next_nodeid][server_peer_id],')'); //here's our stop!
 						this.#realms[server_id].queued[this.#my_peers[next_nodeid][server_peer_id]].push(message);
 						return;
 					}
@@ -450,6 +452,18 @@ class Note{
 				[next_wrap, message] = splice(message, KEY_LENGTH);
 				this.#my_forwards[b64encode(next_keyraw)] = [next_hop, next_wrap]; //key -> next_hop_key, next_wrapping_key
 				clog('Set up forward for messages to go to',this.#known_key_idxs[b64encode(next_hop)]);
+				//Now announce it. Let up to the 4 next nodes key-order-wise know.
+				let all_b64_keys = Object.keys(this.#known_key_idxs).sort();
+				let search_idx = all_b64_keys.indexOf(this.#my_keys.pub64);
+				const announcement = concat(new Uint8Array[MESSAGE_ANNOUNCE], this.#my_keys.pubraw, next_keyraw); //TODO - announcement is my pubkey, hosted pubkey
+				for(let i = 1; i < 5; i++){
+					if((i+search_idx) % all_b64_keys.length === search_idx) break; //stop if all nodes hit
+					if(all_b64_keys[i] === this.#my_keys.pub64) continue; //skip ourselves
+					const dst_idx = this.#known_key_idxs[all_b64_keys[i]];
+					let path = shortest_path(0, dst_idx, this.#idx_links); //Find most direct route to announce (this is not the private part of the link)
+					path.shift(); //remove us from the start of the path
+					this.#send_wrapped_with_route(path, announcement); //and send the announcement. Don't wait.
+				}
 			}else{
 				clog('WARNING: bad forward setup?');
 			}

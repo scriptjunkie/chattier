@@ -26,13 +26,14 @@ function unpack(u8arr) {
 
 //base64 conversion for Uint8Array's
 function b64encode(x) { 
-	return btoa(Array.from(x).map((v) => String.fromCharCode(v)).join(''))
+	return btoa(Array.from(x).map((v) => String.fromCharCode(v)).join(''));
 }
 
 function b64decode(x) {
 	return new Uint8Array(atob(x).split('').map((v) => v.codePointAt(0)));
 }
 
+//splitting and combining Uint8Array's
 function splice(array, index){
 	return [array.subarray(0, index), array.subarray(index)];
 }
