@@ -18,6 +18,8 @@ const MESSAGE_SETUP_FORWARD = 0x17; //set up or tear down forward
 const MESSAGE_SEALED = 0x18; //encrypted
 const MESSAGE_LOST_LINK = 0x19;
 const MESSAGE_ANNOUNCE = 0x1A; //announce another host
+const MESSAGE_DIR_QUERY = 0x1B;
+const MESSAGE_DIR_ANSWER = 0x1C;
 
 const MESSAGE_DEBUG_CON_LOG_REQUEST = 0x20;
 const MESSAGE_DEBUG_CON_LOG = 0x21;
@@ -29,6 +31,7 @@ const PING_LENGTH = 1400; //length of a ping
 const PING_INTERVAL_MS = 2000;
 const SIG_LENGTH = 64;
 const KEY_LENGTH = 65;
+const HASH_LENGTH = 32;
 
 //console log replacement so we can debug
 let myconlog = [];
@@ -65,6 +68,7 @@ class Note{
 	#con_log_listener;
 	#debug_mode;
 	#recheck_timer;
+	#directory;
 
 	constructor(){
 		this.#idx_links = []; //idx -> Set(nodeidx)
@@ -88,6 +92,7 @@ class Note{
 		const server_cache_string = localStorage.getItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME);
 		this.#known_servers = (server_cache_string === null ? {} : JSON.parse(server_cache_string)); //url -> id
 		this.#timeout = setTimeout(() => this.#dosends(), PING_INTERVAL_MS); //send polls regularly
+		this.#directory = {}; //announce_hash -> {key: pubkey64, last: unixtime}
 		clog('timeout ', this.#timeout);
 	}
 
@@ -446,26 +451,41 @@ class Note{
 			[next_keyraw, message] = splice(message, KEY_LENGTH);
 			let next_key = await crypto.subtle.importKey('raw', next_keyraw, {name: 'ECDSA', namedCurve: 'P-256'}, true, ['verify']);
 			[sig, message] = splice(message, SIG_LENGTH);
-			if(await verify(message, sig, next_key) && message[0] === SETUP_FORWARD_INNER){
+			if(await verify(message, sig, next_key) && message.length > 0 && message[0] === SETUP_FORWARD_INNER){
 				[code, message] = splice(message, 1);
 				[next_hop, message] = splice(message, KEY_LENGTH);
 				[next_wrap, message] = splice(message, KEY_LENGTH);
 				this.#my_forwards[b64encode(next_keyraw)] = [next_hop, next_wrap]; //key -> next_hop_key, next_wrapping_key
-				clog('Set up forward for messages to go to',this.#known_key_idxs[b64encode(next_hop)]);
-				//Now announce it. Let up to the 4 next nodes key-order-wise know.
-				let all_b64_keys = Object.keys(this.#known_key_idxs).sort();
-				let search_idx = all_b64_keys.indexOf(this.#my_keys.pub64);
-				const announcement = concat(new Uint8Array[MESSAGE_ANNOUNCE], this.#my_keys.pubraw, next_keyraw); //TODO - announcement is my pubkey, hosted pubkey
-				for(let i = 1; i < 5; i++){
-					if((i+search_idx) % all_b64_keys.length === search_idx) break; //stop if all nodes hit
-					if(all_b64_keys[i] === this.#my_keys.pub64) continue; //skip ourselves
-					const dst_idx = this.#known_key_idxs[all_b64_keys[i]];
-					let path = shortest_path(0, dst_idx, this.#idx_links); //Find most direct route to announce (this is not the private part of the link)
-					path.shift(); //remove us from the start of the path
-					this.#send_wrapped_with_route(path, announcement); //and send the announcement. Don't wait.
+				clog('Set up forward for messages to go to',this.#known_key_idxs[b64encode(next_hop)], 'announcing?', message[0]);
+				if(message[0] ===  1){//request to announce
+					//announce it. Let up to the 4 next nodes key-order-wise know.
+					let all_b64_keys = Object.keys(this.#known_key_idxs).sort();
+					let search_idx = all_b64_keys.indexOf(this.#my_keys.pub64);
+					for(let i = 1; i < 5; i++){
+						if((i+search_idx) % all_b64_keys.length === search_idx) break; //stop if all nodes hit
+						if(all_b64_keys[i] === this.#my_keys.pub64) continue; //skip ourselves
+						const dst_idx = this.#known_key_idxs[all_b64_keys[i]];
+						const hashed_key = new Uint8Array(await crypto.subtle.digest({name: 'SHA-256'}, concat(this.#known_keys[dst_idx], next_keyraw))); //so they don't know real key
+						const announcement = concat(new Uint8Array[MESSAGE_ANNOUNCE], this.#my_keys.pubraw, hashed_key); //TODO - announcement is my pubkey, hosted pubkey
+						let path = shortest_path(0, dst_idx, this.#idx_links); //Find most direct route to announce (this is not the private part of the link)
+						path.shift(); //remove us from the start of the path
+						this.#send_wrapped_with_route(path, announcement); //and send the announcement. Don't wait.
+					}
 				}
 			}else{
 				clog('WARNING: bad forward setup?');
+			}
+		}else if(code === MESSAGE_ANNOUNCE){
+			[next_host, message] = splice(message, KEY_LENGTH);
+			[hashed_key, message] = splice(message, HASH_LENGTH);
+			this.#directory[b64encode(hashed_key)] = {'key': next_host, 'last': new Date().getTime()};
+		}else if(code === MESSAGE_DIR_QUERY){
+			[hashed_key, message] = splice(message, HASH_LENGTH);
+			const hkb64 = b64encode(hashed_key);
+			[next_host, message] = splice(message, KEY_LENGTH);
+			if(hkb64 in this.#directory){
+				const reply = concat(new Uint8Array([MESSAGE_DIR_ANSWER]), hashed_key, this.#directory[hkb64].key);
+				this.send_wrapped_routed(next_host, reply); //TODO: match this up (send to hosted?)
 			}
 		}else if(code !== MESSAGE_PING){
 			clog('unknown message ', message,'len',message.length, 'vals', message.subarray(0,6).join(','));
@@ -477,10 +497,11 @@ class Note{
 		return random_choice(Array.from(this.#idx_links[host_idx]));
 	}
 
-	async setup_my_forwards(){
+	async setup_my_forwards(do_announce){
 		if(this.#idx_links.length < 3 || this.#idx_links[0].size < 2){
-			clog('not enough nodes to setup forwards');
-			return false;
+			throw 'not enough nodes to setup forwards';
+		}else if(this.#my_hidden_keys === null){
+			throw 'No chat keys provisioned - must generate or import';
 		}
 		//pick several hops (2 for now, if we can find them) and generate a key for each.
 		const num_hops = 2;
@@ -488,11 +509,12 @@ class Note{
 		let host_idx = 0;// this.#my_keys.pubraw; //us
 		let rand_route_indexed = [0];
 		for(let i = 0; i < num_hops; i++){
-			const keys = await generate(); //make some intermediate keys
+			const keys = (i < num_hops - 1) ? (await generate()) : this.#my_hidden_keys; //make some intermediate keys
 			if(i > 0){ //every hop except the last one (us), set up the forward
 				//tell host when they get a message for keys.pubraw, wrap it to next keys.pubraw and send to next host
 				const last_hop_key_raw = this.#known_keys[this.#my_forward_chain[i - 1].host_idx];
-				const inner = concat(new Uint8Array([SETUP_FORWARD_INNER]), last_hop_key_raw, this.#my_forward_chain[i - 1].keys.pubraw);
+				const announce_code = i === num_hops - 1 && do_announce ? 1 : 0; //last one in the chain announces
+				const inner = concat(new Uint8Array([SETUP_FORWARD_INNER]), last_hop_key_raw, this.#my_forward_chain[i - 1].keys.pubraw, new Uint8Array([announce_code]));
 				const signature = await sign(inner, keys.ecdsa.privateKey);
 				rand_route_indexed.push(host_idx);
 				this.#send_wrapped_with_route(rand_route_indexed, concat(new Uint8Array([MESSAGE_SETUP_FORWARD]), keys.pubraw, signature, inner));
@@ -547,6 +569,14 @@ class Note{
 		this.#server_ids[id] = wsurl;
 		this.#connect_to_server(wsurl, id);
 		return id;
+	}
+
+	get_my_id(){
+		return this.#my_hidden_keys.pub64;
+	}
+
+	//TODO: return an object which has a message sending function?
+	async open_chat(other_pubkey, on_message_func){
 	}
 }
 
