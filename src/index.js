@@ -20,6 +20,7 @@ const MESSAGE_LOST_LINK = 0x19;
 const MESSAGE_ANNOUNCE = 0x1A; //announce another host
 const MESSAGE_DIR_QUERY = 0x1B;
 const MESSAGE_DIR_ANSWER = 0x1C;
+const MESSAGE_CHAT = 0x1D;
 
 const MESSAGE_DEBUG_CON_LOG_REQUEST = 0x20;
 const MESSAGE_DEBUG_CON_LOG = 0x21;
@@ -69,6 +70,7 @@ class Note {
 	#debug_mode;
 	#recheck_timer;
 	#directory;
+	#received_chat;
 
 	constructor() {
 		this.#idx_links = []; //idx -> Set(nodeidx)
@@ -140,14 +142,18 @@ class Note {
 		return new Promise((cb) => { this.#con_log_listener = cb; });
 	}
 
-	async generate_keys() {
+	//Brand new start method, generating new keys and initializing callback for new chats
+	async generate_keys(received_chat) {
 		this.#my_hidden_keys = await generate();
+		this.#received_chat = received_chat;
 	}
 
-	async set_keys_from_password(password, encrypted) {
+	//load stored keys with password, starting a functional chat client with a callback for new chats
+	async set_keys_from_password(password, received_chat, encrypted) {
 		if (typeof encrypted === "undefined" || encrypted === null)
 			encrypted = localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME);
 		this.#my_hidden_keys = await decrypt_keys_with_password(encrypted, password);
+		this.#received_chat = received_chat;
 		clog('my keys loaded', this.#my_hidden_keys.pub64);
 	}
 
@@ -168,7 +174,7 @@ class Note {
 			let realm = this.#realms[server_id];
 			realm.rtc.peers().forEach(peer_id => {
 				if ((peer_id in realm.queued) && realm.queued[peer_id].length > 0) {
-					clog('sending forward to ', server_id, ' ', peer_id);
+					clog('sending forward to ', server_id +'_'+ peer_id);
 					let to_send = realm.queued[peer_id].splice(0, 1)[0];
 					let packed_inner_length = pack(to_send.length);
 					let buf = concat(new Uint8Array([MESSAGE_PADDED]), packed_inner_length, to_send, new Uint8Array(PING_LENGTH - 1 - to_send.length));
@@ -290,6 +296,7 @@ class Note {
 		this.#send_all_peers(message, reporter_idx, alice_idx, bob_idx); //send announcement to all peers
 		this.#idx_links[alice_idx].delete(bob_idx);
 		this.#idx_links[bob_idx].delete(alice_idx);
+		//TODO: remove unreachable network partition elements
 	}
 
 	//what to do when a new peer connection happens
@@ -420,32 +427,64 @@ class Note {
 			[next_key, message] = splice(message, KEY_LENGTH);
 			let next_b64 = b64encode(next_key);
 			if (next_b64 in this.#my_forwards) { //wrapping forward
-				[next_b64, next_wrap] = this.#my_forwards[next_b64]; //next destination, next wrapping key
-				message = concat(new Uint8Array([MESSAGE_FWD]), next_wrap, await seal_to(message, next_wrap)); //and wrap to the wrap key
+				const orig_next_b64 = next_b64;
+				[next_key, next_wrap] = this.#my_forwards[next_b64]; //next destination, next wrapping key
+				next_b64 = b64encode(next_key);
+				clog("Wrapping forward "+orig_next_b64+" -> "+next_b64);
+				message = concat(new Uint8Array([MESSAGE_FWD]), next_wrap, new Uint8Array([MESSAGE_SEALED]), await seal_to(message, next_wrap)); //and wrap to the wrap key
+			}
+			const mfcl = this.#my_forward_chain.length;
+			if(mfcl > 0 && this.#my_forward_chain[mfcl - 2].link_pubkey === next_b64){
+				for(let i = mfcl - 2; i >= 0; i--){
+					[code, message] = splice(message, 1);
+					clog("DECODING WRAPPED INBOUND MESSAGE "+i+" "+code+" msealed "+MESSAGE_SEALED+" len "+message.length);
+					message = await unseal(message, this.#my_forward_chain[i].keys.ecdh.privateKey);
+				}
+				clog("DECODING FINAL STEP");
+				[code, message] = splice(message, 1);
+				clog("sealed? "+code === MESSAGE_SEALED);
+				message = await unseal(message, this.#my_forward_chain[mfcl - 1].keys.ecdh.privateKey);
+				return this.#handle_msg(message, server_id, peer_int);
 			}
 			if (!(next_b64 in this.#known_key_idxs)) {
-				clog("WARNING: next hop " + next_b64 + " unknown - dropping message");
+				clog("WARNING: next hop " + next_b64 + " unknown - dropping message len " + message.length);
 				return;
 			}
 			let next_nodeid = this.#known_key_idxs[next_b64];
-			if (next_nodeid in this.#my_peers) {
-				for (let server_peer_id in this.#my_peers[next_nodeid]) {
-					if (this.#my_peers[next_nodeid][server_peer_id] in this.#realms[server_id]) {
-						clog('Queueing forward to ', next_b64, ' (', server_peer_id, '_', this.#my_peers[next_nodeid][server_peer_id], ')'); //here's our stop!
-						this.#realms[server_id].queued[this.#my_peers[next_nodeid][server_peer_id]].push(message);
+			if (next_nodeid === 0){
+				clog("Forward for me?! len " + message.length); //it's for me? Somebody probably screwed up.
+				return this.#handle_msg(message, server_id, peer_int);
+			} else if (next_nodeid in this.#my_peers) {
+				for (let myp_server_id in this.#my_peers[next_nodeid]) {
+					if (this.#my_peers[next_nodeid][myp_server_id] in this.#realms[server_id].queued) {
+						clog('Queueing forward to ', next_b64, ' (', myp_server_id, '_', this.#my_peers[next_nodeid][myp_server_id], ')'); //here's our stop!
+						this.#realms[server_id].queued[this.#my_peers[next_nodeid][myp_server_id]].push(message);
 						return;
+					}else{
+						clog("WARN: peer not in realms? server id "+myp_server_id+" mypeer item "+this.#my_peers[next_nodeid][myp_server_id]+" realms "+Object.keys(this.#realms[server_id].queued));
 					}
 				}
 				clog("WARNING: Peer without valid queue?", next_nodeid);
 			}
-			clog('WARNING: next hop ' + next_b64 + ' not direct link - dropping message');
+			clog('WARNING: next hop ' + next_b64 + ' nodeid ' + next_nodeid + ' not direct link - dropping message');
 		} else if (code === MESSAGE_PADDED) {
 			let inner_length;
 			[inner_length, message] = unpack(message);
 			return this.#handle_msg(message.subarray(0, inner_length), server_id, peer_int); //unpad and recurse
 		} else if (code === MESSAGE_SEALED) {
 			clog("Unsealing", code, 'len', message.length);
-			return this.#handle_msg(await unseal(message, this.#my_keys.ecdh.privateKey), server_id, peer_int); //unseal and recurse
+			//try {
+				return this.#handle_msg(await unseal(message, this.#my_keys.ecdh.privateKey), server_id, peer_int); //unseal and recurse
+			//} catch (e) {
+			//	if (this.#my_hidden_keys) {
+			//		try {
+			//			return this.#handle_msg(await unseal(message, this.#my_hidden_keys.ecdh.privateKey), server_id, peer_int);
+			//		} catch (e2) {
+			//			clog("Failed to unseal with hidden key too");
+			//		}
+			//	}
+			//	throw e;
+			//}
 		} else if (code === MESSAGE_SETUP_FORWARD) {
 			let next_hop, next_keyraw, sig, next_wrap;
 			[next_keyraw, message] = splice(message, KEY_LENGTH);
@@ -455,38 +494,66 @@ class Note {
 				[code, message] = splice(message, 1);
 				[next_hop, message] = splice(message, KEY_LENGTH);
 				[next_wrap, message] = splice(message, KEY_LENGTH);
-				this.#my_forwards[b64encode(next_keyraw)] = [next_hop, next_wrap]; //key -> next_hop_key, next_wrapping_key
-				clog('Set up forward for messages to go to', this.#known_key_idxs[b64encode(next_hop)], 'announcing?', message[0]);
+				const next_keyb64 = b64encode(next_keyraw);
+				this.#my_forwards[next_keyb64] = [next_hop, next_wrap]; //key -> next_hop_key, next_wrapping_key
+				clog('Set up forward for messages addressed to ',next_keyb64,' to go to', this.#known_key_idxs[b64encode(next_hop)], 'announcing?', message[0]);
 				if (message[0] === 1) {//request to announce
-					//announce it. Let up to the 4 next nodes key-order-wise know.
+					//announce it. Let up to the 4 next nodes key-order-wise FROM THE next_key know.
+					const hashed_key = new Uint8Array(await crypto.subtle.digest({ name: 'SHA-256' }, concat(this.#my_keys.pubraw, next_keyraw))); //so they don't know real key
+					const hashed_key_b64 = b64encode(hashed_key);
+					clog("Announcing ",hashed_key_b64);
+					this.#directory[hashed_key_b64] = { 'key': this.#my_keys.pubraw, 'last': new Date().getTime() };
+					const announcement = concat(new Uint8Array([MESSAGE_ANNOUNCE]), this.#my_keys.pubraw, hashed_key); //TODO - sign announcement
+					if(next_keyb64 in this.#known_key_idxs){
+						clog("ERROR: trying to set up forward for host key");
+						return;
+					}
+					this.#known_key_idxs[next_keyb64] = 0; //HACK: adding to list to get position in nodes easily
 					let all_b64_keys = Object.keys(this.#known_key_idxs).sort();
-					let search_idx = all_b64_keys.indexOf(this.#my_keys.pub64);
+					delete this.#known_key_idxs[next_keyb64];
+					let search_idx = all_b64_keys.indexOf(next_keyb64);
 					for (let i = 1; i < 5; i++) {
-						if ((i + search_idx) % all_b64_keys.length === search_idx) break; //stop if all nodes hit
-						if (all_b64_keys[i] === this.#my_keys.pub64) continue; //skip ourselves
-						const dst_idx = this.#known_key_idxs[all_b64_keys[i]];
-						const hashed_key = new Uint8Array(await crypto.subtle.digest({ name: 'SHA-256' }, concat(this.#known_keys[dst_idx], next_keyraw))); //so they don't know real key
-						const announcement = concat(new Uint8Array([MESSAGE_ANNOUNCE]), this.#my_keys.pubraw, hashed_key); //TODO - announcement is my pubkey, hosted pubkey
-						let path = shortest_path(0, dst_idx, this.#idx_links); //Find most direct route to announce (this is not the private part of the link)
-						path.shift(); //remove us from the start of the path
-						this.#send_wrapped_with_route(path, announcement); //and send the announcement. Don't wait.
+						const idx = (i + search_idx) % all_b64_keys.length;
+						if (idx === search_idx) break; //stop if all nodes hit
+						if (all_b64_keys[idx] === this.#my_keys.pub64) continue; //skip ourselves
+						const dst_idx = this.#known_key_idxs[all_b64_keys[idx]];
+						try{//TODO: remove nodes from known_key_idxs if unreachable
+							let path = shortest_path(0, dst_idx, this.#idx_links); //Find most direct route to announce (this is not the private part of the link)
+							clog("path ",path,"i",i,idx,search_idx,all_b64_keys.length);
+							this.#send_wrapped_with_route(path, announcement); //and send the announcement. Don't wait.
+						}catch(e){clog("No path to "+dst_idx);}
 					}
 				}
 			} else {
 				clog('WARNING: bad forward setup?');
 			}
 		} else if (code === MESSAGE_ANNOUNCE) {
+			let next_host, hashed_key;
 			[next_host, message] = splice(message, KEY_LENGTH);
 			[hashed_key, message] = splice(message, HASH_LENGTH);
-			this.#directory[b64encode(hashed_key)] = { 'key': next_host, 'last': new Date().getTime() };
-		} else if (code === MESSAGE_DIR_QUERY) {
+			const announcedkey = b64encode(hashed_key);
+			if(!(announcedkey in this.#directory))clog("Learned of ",announcedkey," at ",b64encode(next_host));
+			this.#directory[announcedkey] = { 'key': next_host, 'last': new Date().getTime() };
+		} else if (code === MESSAGE_DIR_QUERY) { //TODO: make this routed
+			let hashed_key, next_host;
 			[hashed_key, message] = splice(message, HASH_LENGTH);
 			const hkb64 = b64encode(hashed_key);
 			[next_host, message] = splice(message, KEY_LENGTH);
 			if (hkb64 in this.#directory) {
 				const reply = concat(new Uint8Array([MESSAGE_DIR_ANSWER]), hashed_key, this.#directory[hkb64].key);
-				this.send_wrapped_routed(next_host, reply); //TODO: match this up (send to hosted?)
+				this.#send_wrapped_routed(next_host, reply); //TODO: match this up (send to hosted?)
 			}
+		} else if (code === MESSAGE_DIR_ANSWER) {
+			let hashed_key, host_key;
+			[hashed_key, message] = splice(message, HASH_LENGTH);
+			[host_key, message] = splice(message, KEY_LENGTH);
+			this.#directory[b64encode(hashed_key)] = { 'key': host_key, 'last': new Date().getTime() };
+		} else if (code === MESSAGE_CHAT) {
+			let sender_pubraw, chat_msg_bin;
+			[sender_pubraw, chat_msg_bin] = splice(message, KEY_LENGTH);
+			const sender_pub64 = b64encode(sender_pubraw);
+			const chat_msg = new TextDecoder().decode(chat_msg_bin);
+			this.#received_chat(chat_msg, sender_pub64);
 		} else if (code !== MESSAGE_PING) {
 			clog('unknown message ', message, 'len', message.length, 'vals', message.subarray(0, 6).join(','));
 		}
@@ -506,7 +573,7 @@ class Note {
 		//pick several hops (2 for now, if we can find them) and generate a key for each.
 		const num_hops = 2;
 		this.#my_forward_chain = [];
-		let host_idx = 0;// this.#my_keys.pubraw; //us
+		let host_idx = 0; //us
 		let rand_route_indexed = [0];
 		for (let i = 0; i < num_hops; i++) {
 			const keys = (i < num_hops - 1) ? (await generate()) : this.#my_hidden_keys; //make some intermediate keys
@@ -517,6 +584,7 @@ class Note {
 				const inner = concat(new Uint8Array([SETUP_FORWARD_INNER]), last_hop_key_raw, this.#my_forward_chain[i - 1].keys.pubraw, new Uint8Array([announce_code]));
 				const signature = await sign(inner, keys.ecdsa.privateKey);
 				rand_route_indexed.push(host_idx);
+				clog("rri ",rand_route_indexed);
 				this.#send_wrapped_with_route(rand_route_indexed, concat(new Uint8Array([MESSAGE_SETUP_FORWARD]), keys.pubraw, signature, inner));
 				clog('setting up forward ' + i + ':', host_idx, '->', rand_route_indexed[i - 1], '=', this.#my_forward_chain[i - 1].host_idx, 'next hop key', b64encode(last_hop_key_raw));
 			}
@@ -532,24 +600,30 @@ class Note {
 		const their_idx = this.#nodeidx_for_pubkey(host);
 		//First find random route as indexed array
 		const rand_route_indexed = find_route_of_length(my_idx, ROUTE_LENGTH, their_idx, this.#idx_links);
+		clog("rri frol ",rand_route_indexed);
 		return this.#send_wrapped_with_route(rand_route_indexed, messagebuffer);
 	}
 
 	async #send_wrapped_with_route(route, messagebuffer) {
 		//wrap message to destination
 		messagebuffer = concat(new Uint8Array([MESSAGE_SEALED]), await seal_to(messagebuffer, this.#known_keys[route[route.length - 1]]));
-		//Successively wrap messages to target
+		//Successively wrap messages to target. First iteration of loop, hop_plus_one will be the final destination and hop will be i (node before hop_plus_one)
 		for (let i = route.length - 2; i > 0; i--) {
+			const hop_plus_one = this.#known_keys[route[i+1]];
+			messagebuffer = concat(new Uint8Array([MESSAGE_FWD]), hop_plus_one, messagebuffer);
 			const hop = this.#known_keys[route[i]];
-			messagebuffer = concat(new Uint8Array([MESSAGE_FWD]), hop, sealed_to_last);
 			if (i > 0) messagebuffer = concat(new Uint8Array([MESSAGE_SEALED]), await seal_to(messagebuffer, hop));
 		}
 
+		if(!(route[1] in this.#known_aliases)){
+			clog("ERROR: bad route? ",route);
+			return;
+		}
 		//find server_id and peer_id that go to next hop and queue it to send
 		for (let server_peer_id of this.#known_aliases[route[1]]) { //e.g. server_peer_id = "1_4"
 			let [server_id, peer_id] = server_peer_id.split('_').map(f => parseInt(f));
 			if (server_id in this.#realms && peer_id in this.#realms[server_id].queued) {
-				clog('queuing relayed send to ' + server_peer_id);
+				clog('queueing relayed send to ' + server_peer_id + ' ('+route[1]+')');
 				this.#realms[server_id].queued[peer_id].push(messagebuffer);
 				return;
 			}
@@ -575,10 +649,46 @@ class Note {
 		return this.#my_hidden_keys.pub64;
 	}
 
-	//TODO: return an object which has a message sending function
-	//Message sending function should send a message to the other pubkey's host
-	//using send_wrapped_routed and it should be encrypted to the other pubkey.
-	async open_chat(other_pubkey, on_message_func) {
+	async #get_host_for_pubkey(other_pubraw) {
+		// Try local cache first
+		const all_node_idxs = Object.keys(this.#known_keys);
+		for (let idx = 0; idx < all_node_idxs.length; idx++) {
+			const node_pub = this.#known_keys[idx];
+			const hashed = new Uint8Array(await crypto.subtle.digest({ name: 'SHA-256' }, concat(node_pub, other_pubraw)));
+			const h64 = b64encode(hashed);
+			if (h64 in this.#directory) {
+				clog("found ",h64," in directory for host ",b64encode(node_pub)," at ",b64encode(this.#directory[h64].key));
+				return this.#directory[h64].key;
+			}
+			clog("did not find ",h64," in directory for host ",b64encode(node_pub)," key ",b64encode(other_pubraw));
+		}
+		clog("did not find ",b64encode(other_pubraw)," in directory ",Object.keys(this.#directory));
+
+		// If not found, broadcast a query to all direct peers
+		//TODO: send wrapped query directly to next nodes key order wise and get wrapped response
+		for (let idx in this.#my_peers) {
+			const node_pub = this.#known_keys[idx];
+			const hashed = new Uint8Array(await crypto.subtle.digest({ name: 'SHA-256' }, concat(node_pub, other_pubraw)));
+			const query = concat(new Uint8Array([MESSAGE_DIR_QUERY]), hashed, this.#my_keys.pubraw);
+			this.#send_wrapped_routed(node_pub, query);
+		}
+		return null;
+	}
+
+	async send_chat(other_pub64, message_text) {
+		clog("Sending chat message "+other_pub64+" "+message_text);
+		const other_pubraw = b64decode(other_pub64);
+		let host = await this.#get_host_for_pubkey(other_pubraw);
+		if (!host) {
+			clog("Failed to find host for " + other_pub64 + " you will need to retry send after a second.");
+			return false;
+		}
+
+		const inner = concat(new Uint8Array([MESSAGE_CHAT]), this.#my_hidden_keys.pubraw, new TextEncoder().encode(message_text));
+		const sealed = concat(new Uint8Array([MESSAGE_FWD]), other_pubraw, new Uint8Array([MESSAGE_SEALED]), await seal_to(inner, other_pubraw));
+		clog("inner chat text len "+inner.length+" sealed len "+sealed.length);
+		await this.#send_wrapped_routed(host, sealed);
+		return true;
 	}
 }
 
