@@ -1,7 +1,7 @@
 //Pick a random (securish) out of a list or throw an exception
 function random_choice(disarray){
 	if(disarray.length === 0){
-		clog('NO OPTIONS');
+		console.log('NO OPTIONS');
 		throw 'NO OPTIONS';
 	}
 	return disarray[crypto.getRandomValues(new Uint32Array(1))[0] % disarray.length];
