@@ -1,5 +1,5 @@
 import { pack } from './src/bits.js';
-import { find_route_of_length, shortest_path, update_depths_added, update_depths_removed } from './src/algorithms.js';
+import { find_route_of_length, random_choice, shortest_path, update_depths_added, update_depths_removed } from './src/algorithms.js';
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 
@@ -100,7 +100,7 @@ describe('test upd', () => {
 //    const orig_idx_depths = JSON.stringify(idx_depths);
     //now our initial graph is set up. Let's rm a random link
     let linksrc,linkdst;
-    [linksrc, linkdst] = all_links[crypto.getRandomValues(new Uint32Array(1))[0] % all_links.length];
+    [linksrc, linkdst] = random_choice(all_links);
     idx_links[linksrc].delete(linkdst);
     idx_links[linkdst].delete(linksrc);
     const udr = update_depths_removed(idx_links, idx_depths, linksrc, linkdst);

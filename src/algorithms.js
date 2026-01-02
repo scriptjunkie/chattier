@@ -4,7 +4,10 @@ function random_choice(disarray){
 		console.log('NO OPTIONS');
 		throw 'NO OPTIONS';
 	}
-	return disarray[crypto.getRandomValues(new Uint32Array(1))[0] % disarray.length];
+	const idx = crypto.getRandomValues(new Uint32Array(1))[0] % disarray.length;
+	if(idx < 4294967296 - (4294967296 % disarray.length)) //fix bias for 4294967296 % disrray.length != 0
+		return disarray[idx];
+	return random_choice(disarray);
 }
 
 //Updates depths for when a link is added
