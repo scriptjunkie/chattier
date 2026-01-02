@@ -1,5 +1,5 @@
 import { pack, unpack, b64encode, b64decode, splice, concat } from './bits.js';
-import { random_choice, random_path, find_route_of_length, shortest_path } from './algorithms.js';
+import { random_choice, random_path, find_route_of_length, shortest_path, update_depths_link, update_depths_removed } from './algorithms.js';
 import { RtcBroker } from './rtcbroker.js';
 import { generate, encrypt_keys_with_password, decrypt_keys_with_password, wrap_to, seal_to, unseal, sign, verify } from './crypto.js';
 
@@ -50,11 +50,11 @@ function clog() {
 //Note class
 class Note {
 	#idx_links;
+	#idx_depths;
 	#known_keys;
 	#known_aliases;
 	#known_key_idxs;
 	#nodes;
-	#known_forwards;
 	#my_forwards;
 	#my_forward_chain;
 	#screen_names;
@@ -75,19 +75,19 @@ class Note {
 	constructor() {
 		this.#idx_links = []; //idx -> Set(nodeidx)
 		this.#known_keys = []; //idx -> pubkeyraw
+		this.#idx_depths = []; //idx -> least hops from me
 		this.#known_aliases = []; //idx -> Set(node_id)
+		this.#my_peers = {}; //idx -> {server_id -> peer_int}
 		this.#known_key_idxs = {}; //pubkey64 -> idx
 		this.#nodes = {}; //node_id -> pubkey64
-		this.#known_forwards = {}; //key -> next_hop_id
 		this.#my_forwards = {}; //key -> next_hop_key, next_wrapping_key
 		this.#my_forward_chain = []; //{node, {host: host_key, keys: keyset}
-		this.#screen_names = { name_to_key: {}, key_to_name: {} };
+		this.#screen_names = { name_to_key: {}, key_to_name: {} }; //TODO: this
 		this.#server_ids = {}; //server_id -> url
 		this.#my_ids = {}; //server_id -> client_id
 		this.#realms = {}; //server_id -> {rtc, [our stuff]}
 		this.#my_keys = null;
 		this.#my_hidden_keys = null;
-		this.#my_peers = {}; //idx -> {server_id -> peer_int}
 		this.#con_log_listener = null;
 		this.#debug_mode = false;
 		this.#recheck_timer = null;
@@ -260,10 +260,12 @@ class Note {
 	}
 
 	#nodeidx_for_pubkey(pubkeyraw) {
-		const pub64 = b64encode(pubkeyraw)
+		const pub64 = b64encode(pubkeyraw);
+		//TODO: use old unused slot? maybe randomly try a few if we've removed nodes?
 		if (!(pub64 in this.#known_key_idxs)) { //newly known node!
 			this.#known_key_idxs[pub64] = this.#known_keys.length;
 			this.#known_keys.push(pubkeyraw); // nodeid -> key64
+			this.#idx_depths.push(null);
 			this.#known_aliases.push(new Set());
 			this.#idx_links.push(new Set());
 		}
@@ -287,16 +289,28 @@ class Note {
 		this.#send_all_peers(message, reporter_idx, alice_idx, bob_idx); //send announcement to all peers
 		this.#idx_links[alice_idx].add(bob_idx);
 		this.#idx_links[bob_idx].add(alice_idx);
+		update_depths_link(this.#idx_links, this.#idx_depths, alice_idx, bob_idx); //Update new depths
 	}
 
 	#forget_known_link(alice_idx, bob_idx, reporter_idx) {
-		if (!this.#idx_links[alice_idx].has(bob_idx)) return;
+		if (!this.#idx_links[alice_idx].has(bob_idx)) return; //exit early if we already forgot this link
 		clog('FORGETTING lost link ' + alice_idx + ' <-> ' + bob_idx);
 		let message = concat(new Uint8Array([MESSAGE_LOST_LINK]), this.#known_keys[alice_idx], this.#known_keys[bob_idx]);
 		this.#send_all_peers(message, reporter_idx, alice_idx, bob_idx); //send announcement to all peers
 		this.#idx_links[alice_idx].delete(bob_idx);
 		this.#idx_links[bob_idx].delete(alice_idx);
-		//TODO: remove unreachable network partition elements
+		const id = update_depths_removed(this.#idx_links, this.#idx_depths, alice_idx, bob_idx);
+		if(id !== null){
+			clog("PARTITION ", id);
+			for(let chain_el of this.#my_forward_chain){
+				if(this.#idx_depths[chain_el.host_idx] === null){
+					clog("LOST CHAIN");
+					this.setup_my_forwards(true); //re-set-up forwards
+					break;
+				}
+			}
+			//TODO: remove unreachable network partition elements? Or naw? Maybe on timeout to give chance for reconnection?
+		}
 	}
 
 	//what to do when a new peer connection happens
