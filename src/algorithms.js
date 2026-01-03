@@ -85,17 +85,12 @@ function update_depths_removed(idx_links, idx_depths, to_idx, from_idx){
 
 //Pick a random path to a node with a reachset (an array where each element at index I is a set of all nodes I hops away from the start)
 function random_path(starting_choice, reachset, idx_links){
-	let choices_back_to_src = [starting_choice];
+	let choices = [starting_choice];
 	for(let i = reachset.length - 2; i >= 0; i--){
-		let options = []; //find all options in reachset[i]
-		for(let candidate of reachset[i]){
-			if(idx_links[candidate].has(choices_back_to_src[choices_back_to_src.length - 1])){
-				options.push(candidate);
-			}
-		}
-		choices_back_to_src.push(random_choice(options)); //pick a random one for next choice
+		let options = reachset[i].values().filter(a=>idx_links[a].has(choices[choices.length - 1])); //find all options in reachset[i]
+		choices.push(random_choice(Array.from(options))); //pick a random one for next choice
 	}
-	return choices_back_to_src;
+	return choices;
 }
 
 //Find a random route of a given length between two nodes, given a link index
@@ -111,13 +106,8 @@ function find_route_of_length(src, length, dst, idx_links){
 		current_iterating_list.push(nexts);
 	}
 	//Ok, now we have sets of everything up to n/2 hops from both src and dst. Pick a random of intersection
-	let options = [];
-	for(let candidate of hops_from_src[hops_from_src.length - 1]){
-		if(hops_from_dst[hops_from_dst.length - 1].has(candidate)){
-			options.push(candidate);
-		}
-	}
-	let choice = random_choice(options);
+	let options = hops_from_src[hops_from_src.length - 1].values().filter(a=>hops_from_dst[hops_from_dst.length - 1].has(a));
+	let choice = random_choice(Array.from(options));
 	//now random path to src and dest and merge the two lists
 	return random_path(choice, hops_from_src, idx_links).reverse().concat(random_path(choice, hops_from_dst, idx_links).slice(1));
 }
