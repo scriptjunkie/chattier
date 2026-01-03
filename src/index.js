@@ -283,9 +283,8 @@ class Note {
 
 	#nodeidx_for_pubkey(pubkeyraw, noadd) {
 		const pub64 = b64encode(pubkeyraw);
-		//TODO: use old unused slot? maybe randomly try a few if we've removed nodes?
 		if (!(pub64 in this.#known_key_idxs) && !noadd) { //newly known node!
-			//Look for an old unused idx
+			//Look for an old unused idx. Randomly try four times so our list doesn't expand unless ~80% full without complex data structures.
 			let new_idx = this.#known_keys.length;
 			for(let i = 0; i < 4; i++){
 				let test_idx = Math.floor(Math.random() * this.#known_keys.length);
@@ -474,10 +473,19 @@ class Note {
 				let src_their_nodeid, dst_their_nodeid;
 				[src_their_nodeid, message] = unpack(message);
 				[dst_their_nodeid, message] = unpack(message); //TODO: sign links and validate cryptographically? Probably not worth it
+				// this is a potential race where you 
+				//1. Start a new connection to a new node
+				//2. Are notified of an old node/link dropping via another link and remove from your DB, then send MESSAGE_LOST_LINK to new node
+				//3. While in flight, new node sends MESSAGE_KNOWN_KEYS_AND_LINKS, including dropped link since it hasn't gotten that notification yet
+				//4. You add dropped back. New node won't return MESSAGE_LOST_LINK back to you since it got it from you. You're stuck with old bad data.
+				//solutions? Maybe return dropped notices back regardless? Or for new connections with a timeout?
+				//Should we not send MESSAGE_NEW_LINK for MESSAGE_KNOWN_KEYS_AND_LINKS? Re-joining partitions seems to make that necessary though.
+				//Or just periodically refresh random nodes' links from the source?
 				if(!(src_their_nodeid in their_nodeid_to_ours) || !(dst_their_nodeid in their_nodeid_to_ours)) continue;
 				const our_src_id = their_nodeid_to_ours[src_their_nodeid];
 				const our_dst_id = their_nodeid_to_ours[dst_their_nodeid];
 				clog('received note of link ', our_src_id, ' -> ', our_dst_id);
+				//TODO: optimization in case we just learned about a bunch of links: combine all newly learned into one mega MESSAGE_NEW_LINK?
 				if (our_src_id !== 0 && our_dst_id !== 0) this.#note_known_link(our_src_id, our_dst_id, their_idx); //save the link if not about us
 			}
 		} else if (code === MESSAGE_NEW_LINK) { //Just src, dst keys
