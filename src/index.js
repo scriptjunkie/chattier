@@ -33,12 +33,27 @@ const PING_INTERVAL_MS = 2000;
 const SIG_LENGTH = 64;
 const KEY_LENGTH = 65;
 const HASH_LENGTH = 32;
+const EMPTY_KEY = new Uint8Array(KEY_LENGTH);
 
 //console log replacement so we can debug
 let myconlog = [];
 const basetime = (new Date()).getTime();
 function clog() {
-	let argz = [((new Date()).getTime() - basetime) / 1000].concat(Array.from(arguments));
+	const stk = new Error().stack.split("\n").slice(2);
+	const simple = stk.map(a=>{
+		const colons = a.split(":");
+		return colons.length > 1 ? [colons[1].split("/").slice(-1)[0], colons[2]] : ['','']
+	});
+	let stack = '';
+	for(let i = 0; i < simple.length; i++){
+		if(i === 0)
+			stack = simple[0][0] + ':' + simple[0][1];
+		else if(simple[i][0] === simple[i-1][0])
+			stack += ','+simple[i][1];
+		else
+			stack += ' ' + simple[i][0] + ':' + simple[i][1];
+	}
+	let argz = [((new Date()).getTime() - basetime) / 1000, stack].concat(Array.from(arguments));
 	try {
 		console.log.apply(console, argz);
 		myconlog.push(argz);
@@ -238,6 +253,13 @@ class Note {
 		const full_node_id = make_id(server_id, peer_int);
 		if (full_node_id in this.#nodes) {
 			const idx = this.#known_key_idxs[this.#nodes[full_node_id]];
+			for(let fwd in this.#my_forwards){
+				next_b64 = b64encode(this.#my_forwards[fwd][0]);
+				if(next_b64 in this.#known_key_idxs && this.#known_key_idxs[next_b64] === idx){
+					clog("Clearing foward to", idx);
+					delete this.#my_forwards[fwd]; //shut down forward if we lost peer
+				}
+			}
 			//Now close peer conn
 			if (idx in this.#my_peers && server_id in this.#my_peers[idx]) {
 				delete this.#my_peers[idx][server_id];
@@ -259,15 +281,27 @@ class Note {
 		return their_idx;
 	}
 
-	#nodeidx_for_pubkey(pubkeyraw) {
+	#nodeidx_for_pubkey(pubkeyraw, noadd) {
 		const pub64 = b64encode(pubkeyraw);
 		//TODO: use old unused slot? maybe randomly try a few if we've removed nodes?
-		if (!(pub64 in this.#known_key_idxs)) { //newly known node!
-			this.#known_key_idxs[pub64] = this.#known_keys.length;
-			this.#known_keys.push(pubkeyraw); // nodeid -> key64
-			this.#idx_depths.push(null);
-			this.#known_aliases.push(new Set());
-			this.#idx_links.push(new Set());
+		if (!(pub64 in this.#known_key_idxs) && !noadd) { //newly known node!
+			//Look for an old unused idx
+			let new_idx = this.#known_keys.length;
+			for(let i = 0; i < 4; i++){
+				let test_idx = Math.floor(Math.random() * this.#known_keys.length);
+				if(this.#known_keys[test_idx] === null){
+					new_idx = test_idx;
+					break;
+				}
+			}
+			clog("new key",pub64,"at",new_idx);
+			this.#known_key_idxs[pub64] = new_idx;
+			this.#known_keys[new_idx] = pubkeyraw; // nodeid -> key64
+			this.#idx_depths[new_idx] = null;
+			this.#known_aliases[new_idx] = new Set();
+			this.#idx_links[new_idx] = new Set();
+		}else if(!(pub64 in this.#known_key_idxs) && noadd){
+			return null;
 		}
 		return this.#known_key_idxs[pub64];
 	}
@@ -304,12 +338,29 @@ class Note {
 			clog("PARTITION ", id);
 			for(let chain_el of this.#my_forward_chain){
 				if(this.#idx_depths[chain_el.host_idx] === null){
-					clog("LOST CHAIN");
+					clog("LOST CHAIN - lost idx", chain_el.host_idx);
 					this.setup_my_forwards(true); //re-set-up forwards
 					break;
 				}
 			}
-			//TODO: remove unreachable network partition elements? Or naw? Maybe on timeout to give chance for reconnection?
+			// Remove unreachable network partition elements
+			let queued = [id];
+			while(queued.length > 0){
+				const unreachable_idx = queued.shift();
+				clog("clearing ",unreachable_idx);
+				if (unreachable_idx in this.#my_peers) clog("ERROR: this should never happen: ",unreachable_idx,"in peers");
+				for(let next of this.#idx_links[unreachable_idx]){ //remove al
+					queued.push(next);
+					delete this.#idx_links[unreachable_idx][next];
+					delete this.#idx_links[next][unreachable_idx];
+				}
+				//Now #idx_links should be empty for this node. Keep node around if in known_aliases/nodes until it gets removed by the server.
+				if(this.#known_keys[unreachable_idx] && this.#known_aliases[unreachable_idx].size === 0){
+					const k = this.#known_keys[unreachable_idx];
+					this.#known_keys[unreachable_idx] = null;
+					delete this.#known_key_idxs[b64encode(k)];
+				}
+			}
 		}
 	}
 
@@ -335,7 +386,7 @@ class Note {
 		// Send known keys and links by nodeid
 		let known_keys_and_links_chunks = [new Uint8Array([MESSAGE_KNOWN_KEYS_AND_LINKS])];
 		known_keys_and_links_chunks.push(pack(this.#known_keys.length));
-		this.#known_keys.forEach(key => known_keys_and_links_chunks.push(key));
+		this.#known_keys.forEach(key => known_keys_and_links_chunks.push(key?key:EMPTY_KEY));
 		for (let src = 0; src < this.#idx_links.length; src++) {
 			for (let dst of this.#idx_links[src]) {
 				if (src < dst) { // only do one direction, a->b, not b->a
@@ -413,29 +464,34 @@ class Note {
 			for (let i = 0; i < num_keys; i++) {
 				let pubk;
 				[pubk, message] = splice(message, KEY_LENGTH);
-				their_nodeid_to_ours[i] = this.#nodeidx_for_pubkey(pubk);
-				clog('received note of key ', b64encode(pubk), ' - node ', this.#nodeidx_for_pubkey(pubk), 'from', their_nodeid_to_ours[0]);
+				if(indexedDB.cmp(pubk, EMPTY_KEY) !== 0){
+					their_nodeid_to_ours[i] = this.#nodeidx_for_pubkey(pubk);
+					clog('received note of key ', b64encode(pubk), ' - node ', this.#nodeidx_for_pubkey(pubk), 'from', their_nodeid_to_ours[0]);
+				}
 			}
 			const their_idx = their_nodeid_to_ours[0]; //Get their idx
 			while (message.length > 0) {
 				let src_their_nodeid, dst_their_nodeid;
 				[src_their_nodeid, message] = unpack(message);
-				[dst_their_nodeid, message] = unpack(message); //TODO: validate?
+				[dst_their_nodeid, message] = unpack(message); //TODO: sign links and validate cryptographically? Probably not worth it
+				if(!(src_their_nodeid in their_nodeid_to_ours) || !(dst_their_nodeid in their_nodeid_to_ours)) continue;
 				const our_src_id = their_nodeid_to_ours[src_their_nodeid];
 				const our_dst_id = their_nodeid_to_ours[dst_their_nodeid];
 				clog('received note of link ', our_src_id, ' -> ', our_dst_id);
-				if (our_src_id !== 0 && our_dst_id !== 0) this.#note_known_link(our_src_id, our_dst_id, their_idx); //save the link. But don't trust our links
+				if (our_src_id !== 0 && our_dst_id !== 0) this.#note_known_link(our_src_id, our_dst_id, their_idx); //save the link if not about us
 			}
 		} else if (code === MESSAGE_NEW_LINK) { //Just src, dst keys
 			const arr = splice(message, KEY_LENGTH).map(a => this.#nodeidx_for_pubkey(a));
+			if(arr[0] === 0 || arr[1] === 0) return; //we already know about our own links
 			clog("MESSAGE_NEW_LINK", arr[0], arr[1], 'from', server_id + '_' + peer_int);
 			const their_idx = this.#realms[server_id].peer_int_to_idx[peer_int]; // this should be set by now
 			this.#note_known_link(arr[0], arr[1], their_idx);
 		} else if (code === MESSAGE_LOST_LINK) { //Just src, dst keys. TODO: sign this
-			const arr = splice(message, KEY_LENGTH).map(a => this.#nodeidx_for_pubkey(a));
-			clog("MESSAGE_LOST_LINK", arr[0], arr[1], 'from', server_id + '_' + peer_int);
+			const karr = splice(message, KEY_LENGTH);
+			const arr = karr.map(a => this.#nodeidx_for_pubkey(a, true)); //don't add if they're being removed
+			clog("MESSAGE_LOST_LINK", arr[0], arr[1], karr.map(a=>b64encode(a)), 'from', server_id + '_' + peer_int);
 			const their_idx = this.#realms[server_id].peer_int_to_idx[peer_int]; // this should be set by now
-			this.#forget_known_link(arr[0], arr[1], their_idx);
+			if(arr[0] && arr[1]) this.#forget_known_link(arr[0], arr[1], their_idx);
 		} else if (code === MESSAGE_FWD) {
 			let next_key, next_wrap;
 			[next_key, message] = splice(message, KEY_LENGTH);
@@ -509,8 +565,13 @@ class Note {
 				[next_hop, message] = splice(message, KEY_LENGTH);
 				[next_wrap, message] = splice(message, KEY_LENGTH);
 				const next_keyb64 = b64encode(next_keyraw);
+				const nh64 = b64encode(next_hop);
+				if(!(nh64 in this.#known_key_idxs) || !(this.#known_key_idxs[nh64] in this.#my_peers)){
+					clog("WARNING Request to set up forward, but forward hop ",nh64," isn't a peer");
+					return;
+				}
 				this.#my_forwards[next_keyb64] = [next_hop, next_wrap]; //key -> next_hop_key, next_wrapping_key
-				clog('Set up forward for messages addressed to ',next_keyb64,' to go to', this.#known_key_idxs[b64encode(next_hop)], 'announcing?', message[0]);
+				clog('Set up forward for messages addressed to ',next_keyb64,' to go to', this.#known_key_idxs[nh64], 'announcing?', message[0]);
 				if (message[0] === 1) {//request to announce
 					//announce it. Let up to the 4 next nodes key-order-wise FROM THE next_key know.
 					const hashed_key = new Uint8Array(await crypto.subtle.digest({ name: 'SHA-256' }, concat(this.#my_keys.pubraw, next_keyraw))); //so they don't know real key
