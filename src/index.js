@@ -3,7 +3,7 @@ import { random_choice, random_path, find_route_of_length, shortest_path, update
 import { RtcBroker } from './rtcbroker.js';
 import { generate, encrypt_keys_with_password, decrypt_keys_with_password, wrap_to, seal_to, unseal, sign, verify } from './crypto.js';
 
-const LOCAL_STORAGE_ENC_KEY_NAME = "chattier_encrypted_hidden_key";
+const LOCAL_STORAGE_ENC_KEY_NAME = "chattier_encrypted_settings";
 const LOCAL_STORAGE_KNOWN_SERVERS_NAME = "chattier_known_servers";
 
 const MIN_CONNECTIONS = 2; //try to always ensure this many connections
@@ -157,10 +157,16 @@ class Note {
 		return new Promise((cb) => { this.#con_log_listener = cb; });
 	}
 
+	async set_screen_name(pub64, screen_name) {
+		this.#screen_names.name_to_key[screen_name] = pub64;
+		this.#screen_names.key_to_name[pub64] = screen_name;
+	}
+
 	//Brand new start method, generating new keys and initializing callback for new chats
-	async generate_keys(received_chat) {
+	async generate_keys(received_chat, screen_name) {
 		this.#my_hidden_keys = await generate();
 		this.#received_chat = received_chat;
+		this.set_screen_name(this.#my_keys.pub64, screen_name);
 	}
 
 	//load stored keys with password, starting a functional chat client with a callback for new chats
@@ -168,14 +174,20 @@ class Note {
 		if (typeof encrypted === "undefined" || encrypted === null)
 			encrypted = localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME);
 		this.#my_hidden_keys = await decrypt_keys_with_password(encrypted, password);
+		let {screen_name, screen_name_len} = this.#my_hidden_keys.data;
+		screen_name = screen_name.substr(0,screen_name.length - ((128 - (screen_name_len % 128)) % 128)); //remove padding
+		this.set_screen_name(this.#my_keys.pub64, screen_name); //Save locally
 		this.#received_chat = received_chat;
 		clog('my keys loaded', this.#my_hidden_keys.pub64);
 	}
 
 	async export_keys_with_password(password) {
 		clog('storing and exporting keys');
-		const encd = await encrypt_keys_with_password(this.#my_hidden_keys.ecdh.privateKey, password);
-		localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, encd);
+		let screen_name = this.#screen_names.key_to_name[this.#my_keys.pub64];
+		const screen_name_len = new TextEncoder().encode(screen_name).length;
+		screen_name = screen_name + 'X'.repeat((128 - (screen_name_len % 128)) % 128); //don't leak length of screen name
+		const keybin64 = await encrypt_keys_with_password(this.#my_hidden_keys.ecdh.privateKey, password, {screen_name, screen_name_len});
+		localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, keybin64);
 		return encd;
 	}
 
@@ -351,7 +363,7 @@ class Note {
 				const unreachable_idx = queued.shift();
 				clog("clearing ",unreachable_idx);
 				if (unreachable_idx in this.#my_peers) clog("ERROR: this should never happen: ",unreachable_idx,"in peers");
-				for(let next of this.#idx_links[unreachable_idx]){ //remove al
+				for(let next of Array.from(this.#idx_links[unreachable_idx])) { //remove al
 					queued.push(next);
 					delete this.#idx_links[unreachable_idx][next];
 					delete this.#idx_links[next][unreachable_idx];
@@ -642,10 +654,10 @@ class Note {
 			this.#directory[hash_64] = { key, referrer, 'last': new Date().getTime() };
 		} else if (code === MESSAGE_CHAT) {
 			let sender_pubraw, chat_msg_bin;
-			[sender_pubraw, chat_msg_bin] = splice(message, KEY_LENGTH);
+			[sender_pubraw, chat_msg_bin] = splice(message, KEY_LENGTH); //TODO: verify signature/HMAC
 			const sender_pub64 = b64encode(sender_pubraw);
-			const chat_msg = new TextDecoder().decode(chat_msg_bin);
-			this.#received_chat(chat_msg, sender_pub64);
+			const {n, m, t} = JSON.parse(new TextDecoder().decode(chat_msg_bin));
+			this.#received_chat(m, sender_pub64, n, t); //message, sender, screen name, time
 		} else if (code !== MESSAGE_PING) {
 			clog('unknown message code', code, 'len', message.length, 'vals', message.subarray(0, 6).join(','));
 		}
@@ -805,7 +817,9 @@ class Note {
 			return false;
 		}
 
-		const inner = concat(new Uint8Array([MESSAGE_CHAT]), this.#my_hidden_keys.pubraw, new TextEncoder().encode(message_text));
+		const t = Math.floor(new Date().getTime()/1000);
+		const message_json = JSON.stringify({n:this.#screen_names.key_to_name[this.#my_keys.pub64], m: message_text, t});
+		const inner = concat(new Uint8Array([MESSAGE_CHAT]), this.#my_hidden_keys.pubraw, new TextEncoder().encode(message_json));
 		const sealed = concat(new Uint8Array([MESSAGE_FWD]), other_pubraw, new Uint8Array([MESSAGE_SEALED]), await seal_to(inner, other_pubraw));
 		clog("inner chat text len "+inner.length+" sealed len "+sealed.length);
 		await this.#send_wrapped_routed(host_idx, sealed);

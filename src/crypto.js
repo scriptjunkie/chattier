@@ -7,9 +7,10 @@ async function decrypt_keys_with_password(encryptedKey, password){
 	const iv = enckbin.subarray(16,32);
 	const pbkdfKey = await crypto.subtle.importKey('raw',(new TextEncoder()).encode(password),{ name: 'PBKDF2' }, false, ['deriveBits', 'deriveKey']);
 	const wrappingKey = await crypto.subtle.deriveKey({name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256'}, pbkdfKey, { name: 'AES-GCM', length: 256 },true,['encrypt', 'decrypt']);
-	const exported = enckbin.subarray(32);
-	const dewrapped = await crypto.subtle.decrypt({name: 'AES-GCM', iv}, wrappingKey, exported);
-	const ecdh_privkey = await crypto.subtle.importKey('pkcs8', dewrapped, { name: 'ECDH', namedCurve: 'P-256'}, true, ['deriveBits']);
+	const exported_k = enckbin.subarray(32);
+	const dewrapped = await crypto.subtle.decrypt({name: 'AES-GCM', iv}, wrappingKey, exported_k);
+	const {data, exported} = JSON.parse(new TextDecoder().decode(dewrapped));
+	const ecdh_privkey = await crypto.subtle.importKey('pkcs8', b64decode(exported), { name: 'ECDH', namedCurve: 'P-256'}, true, ['deriveBits']);
 	//Convert private ECDH key to public key by exporing as JWK and deleting 'd'
 	let ecdh_priv_jwk = await crypto.subtle.exportKey('jwk', ecdh_privkey);
 	let ecdh_pub_jwk = JSON.parse(JSON.stringify(ecdh_priv_jwk)); //make a deep copy by serializing/unserializing
@@ -24,16 +25,17 @@ async function decrypt_keys_with_password(encryptedKey, password){
 	let ecdsa_pubkey = await crypto.subtle.importKey('jwk', ecdh_priv_jwk, {name: 'ECDSA', namedCurve: 'P-256'}, true, ['verify']);
 	const pubraw = new Uint8Array(await crypto.subtle.exportKey('raw', ecdsa_pubkey));//my pub key as arraybuffer
 	const pub64 = b64encode(pubraw);
-	return {ecdh: {privateKey: ecdh_privkey, publicKey: ecdh_pubkey}, ecdsa: {privateKey: ecdsa_privkey, publicKey: ecdsa_pubkey}, pubraw, pub64};
+	return {ecdh: {privateKey: ecdh_privkey, publicKey: ecdh_pubkey}, ecdsa: {privateKey: ecdsa_privkey, publicKey: ecdsa_pubkey}, pubraw, pub64, data};
 }
 
-async function encrypt_keys_with_password(key, password){
+async function encrypt_keys_with_password(key, password, data){
 	const pbkdfKey = await crypto.subtle.importKey('raw',(new TextEncoder()).encode(password),{ name: 'PBKDF2' }, false, ['deriveBits', 'deriveKey']);
 	const salt = crypto.getRandomValues(new Uint8Array(16));
 	const wrappingKey = await crypto.subtle.deriveKey({name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256'}, pbkdfKey, { name: 'AES-GCM', length: 256 },true,['encrypt', 'decrypt']);
 	const iv = crypto.getRandomValues(new Uint8Array(16));
-	const exported = await crypto.subtle.exportKey('pkcs8', key);
-	const wrapped = await crypto.subtle.encrypt({name: 'AES-GCM', iv}, wrappingKey, exported);
+	const exported = b64encode(new Uint8Array(await crypto.subtle.exportKey('pkcs8', key)));
+	const bin = new TextEncoder().encode(JSON.stringify({data, exported}));
+	const wrapped = await crypto.subtle.encrypt({name: 'AES-GCM', iv}, wrappingKey, bin);
 	const wrappedblob = new Blob([salt, iv, wrapped]);
 	return b64encode(new Uint8Array(await wrappedblob.arrayBuffer()));
 }
