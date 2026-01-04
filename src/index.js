@@ -255,7 +255,7 @@ class Note {
 		if (full_node_id in this.#nodes) {
 			const idx = this.#known_key_idxs[this.#nodes[full_node_id]];
 			for(let fwd in this.#my_forwards){
-				next_b64 = b64encode(this.#my_forwards[fwd][0]);
+				let next_b64 = b64encode(this.#my_forwards[fwd][0]);
 				if(next_b64 in this.#known_key_idxs && this.#known_key_idxs[next_b64] === idx){
 					clog("Clearing foward to", idx);
 					delete this.#my_forwards[fwd]; //shut down forward if we lost peer
@@ -524,8 +524,9 @@ class Note {
 					message = await unseal(message, chain[i].keys.ecdh.privateKey);
 				}
 				[code, message] = splice(message, 1);
-				clog("sealed? "+code === MESSAGE_SEALED);
+				clog("sealed? ", code[0], MESSAGE_SEALED, 'len', message.length);
 				message = await unseal(message, chain[chain.length - 1].keys.ecdh.privateKey);
+				clog("response? ", message.length, 'answer', message[0], MESSAGE_DIR_ANSWER);
 				return this.#handle_msg(message, server_id, peer_int);
 			}
 			if (!(next_b64 in this.#known_key_idxs)) {
@@ -619,15 +620,15 @@ class Note {
 			if(!(announcedkey in this.#directory)) clog("Learned of ",announcedkey," at ",b64encode(key));
 			this.#directory[announcedkey] = { key, referrer: this.#my_keys.pubraw, 'last': new Date().getTime() };
 		} else if (code === MESSAGE_DIR_QUERY) {
-			let hashed_key, next_host;
+			let hashed_key, next_key;
 			[hashed_key, message] = splice(message, HASH_LENGTH);
 			const hkb64 = b64encode(hashed_key);
 			[next_key, message] = splice(message, KEY_LENGTH);
 			if (hkb64 in this.#directory) {
-				clog("MESSAGE_DIR_QUERY sending response for",hkb64);
+				clog("MESSAGE_DIR_QUERY sending response for",hkb64,"from",server_id+'_'+peer_int);
 				const inner = concat(new Uint8Array([MESSAGE_DIR_ANSWER]), hashed_key, this.#directory[hkb64].key, this.#my_keys.pubraw);
 				const outer = concat(new Uint8Array([MESSAGE_FWD]), next_key, new Uint8Array([MESSAGE_SEALED]), await seal_to(inner, next_key));
-				this.#realms[server_id].queued[peer_id].push(outer);
+				this.#realms[server_id].queued[peer_int].push(outer);
 			}else{
 				clog("MESSAGE_DIR_QUERY but don't know",hkb64);
 			}
@@ -636,7 +637,9 @@ class Note {
 			[hashed_key, message] = splice(message, HASH_LENGTH);
 			[key, message] = splice(message, KEY_LENGTH);
 			[referrer, message] = splice(message, KEY_LENGTH);
-			this.#directory[b64encode(hashed_key)] = { key, referrer, 'last': new Date().getTime() };
+			const hash_64 = b64encode(hashed_key);
+			clog("MESSAGE_DIR_ANSWER", hash_64);
+			this.#directory[hash_64] = { key, referrer, 'last': new Date().getTime() };
 		} else if (code === MESSAGE_CHAT) {
 			let sender_pubraw, chat_msg_bin;
 			[sender_pubraw, chat_msg_bin] = splice(message, KEY_LENGTH);
@@ -774,17 +777,19 @@ class Note {
 		// If not found, send wrapped query to next nodes key order wise and get wrapped response
 		const keys = Object.keys(this.#known_key_idxs).concat(other_pub64).sort();
 		let search_idx = keys.indexOf(other_pub64); //get position in nodes by key order, search the next up to 4
-		for (let i = (search_idx + 1) % keys.length; i != search_idx && i != (search_idx + 5) % keys.length; i = (i + 1) % keys.length) {
-			if (keys[i] === this.#my_keys.pub64) continue; //skip ourselves
+		let tries = 0;
+		for (let i = (search_idx + 1) % keys.length; i != search_idx && tries < 4; i = (i + 1) % keys.length) {
 			const idx = this.#known_key_idxs[keys[i]];
+			if (keys[i] === this.#my_keys.pub64 || this.#idx_depths[idx] === null) continue; //skip ourselves and forgotten nodes
+			tries += 1;
 			const node_pub = this.#known_keys[idx];
 			//set up
 			console.log("Making chain to",idx);
 			const chain = await this.#temp_chain_to(idx);
 			console.log("Sending MESSAGE_DIR_QUERY to",idx);
-			const query = concat(new Uint8Array([MESSAGE_DIR_QUERY]), hashed, chain[chain.length - 1].keys.pubraw);
 			const hashed = new Uint8Array(await crypto.subtle.digest({ name: 'SHA-256' }, concat(node_pub, other_pubraw)));
-			const outer = concat(new Uint8Array([MESSAGE_FWD]), next_key, new Uint8Array([MESSAGE_SEALED]), await seal_to(query, node_pub));
+			const query = concat(new Uint8Array([MESSAGE_DIR_QUERY]), hashed, chain[chain.length - 1].keys.pubraw);
+			const outer = concat(new Uint8Array([MESSAGE_FWD]), node_pub, new Uint8Array([MESSAGE_SEALED]), await seal_to(query, node_pub));
 			this.#send_wrapped_with_route(chain.map(c=>c.host_idx), outer);
 			//TODO: clean these up
 		}
