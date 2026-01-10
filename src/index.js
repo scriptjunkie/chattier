@@ -188,7 +188,7 @@ class Note {
 		screen_name = screen_name + 'X'.repeat((128 - (screen_name_len % 128)) % 128); //don't leak length of screen name
 		const keybin64 = await encrypt_keys_with_password(this.#my_hidden_keys.ecdh.privateKey, password, {screen_name, screen_name_len});
 		localStorage.setItem(LOCAL_STORAGE_ENC_KEY_NAME, keybin64);
-		return encd;
+		return keybin64;
 	}
 
 	getlinks() {
@@ -318,13 +318,20 @@ class Note {
 		return this.#known_key_idxs[pub64];
 	}
 
-	//Sends a message immediately to all direct peers except for the listed idx's.
+	//Sends a message immediately to all direct peers except for the listed idx's. NOTE: sending to non-registered ones too (ones we may have sent link list to but haven't received ID from yet)
 	#send_all_peers(message, idx1, idx2, idx3) {
-		for (let idx in this.#my_peers) {
-			if (idx === idx1 || idx === idx2 || idx === idx3) continue; // don't report back to who reported it to us
-			const peer_server_id = Object.keys(this.#my_peers[idx])[0];
-			const peer_int = this.#my_peers[idx][peer_server_id];
-			this.#realms[peer_server_id].rtc.send(peer_int, message);
+		for (let peer_server_id in this.#realms){
+			let realm = this.#realms[peer_server_id];
+			for (let peer_int of realm.rtc.peers()){
+				const full_node_id = make_id(peer_server_id, peer_int);
+				if (full_node_id in this.#nodes) {
+					const idx = this.#known_key_idxs[this.#nodes[full_node_id]];
+					if (idx === idx1 || idx === idx2 || idx === idx3) continue; // don't report back to who reported it to us
+				}else{
+					clog('Link to '+full_node_id+' not in nodes yet? Trying to send anyway.');
+				}
+				realm.rtc.send(peer_int, message);
+			}
 		}
 	}
 
@@ -400,7 +407,7 @@ class Note {
 		// Send known keys and links by nodeid
 		let known_keys_and_links_chunks = [new Uint8Array([MESSAGE_KNOWN_KEYS_AND_LINKS])];
 		known_keys_and_links_chunks.push(pack(this.#known_keys.length));
-		this.#known_keys.forEach(key => known_keys_and_links_chunks.push(key?key:EMPTY_KEY));
+		this.#known_keys.forEach(key => known_keys_and_links_chunks.push(key?key:EMPTY_KEY));//TODO: omit dead ones? Split if send is too many KB?
 		for (let src = 0; src < this.#idx_links.length; src++) {
 			for (let dst of this.#idx_links[src]) {
 				if (src < dst) { // only do one direction, a->b, not b->a
