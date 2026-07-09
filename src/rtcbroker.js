@@ -21,6 +21,7 @@ class RtcBroker {
 	#known_clients;
 	#newclient;
 	#sock;
+	#closed;
 	
 	constructor(wsurl, zone, onclose, onerror, onstarted, onnewconn, onnodeexit, onmessage, onconnclose, onnewclient) {
 		this.#client_id = null;
@@ -34,31 +35,68 @@ class RtcBroker {
 		this.#newclient = onnewclient;
 		this.#recheck_timer = null;
 		this.#known_clients = new Set();
+		this.#closed = false;
 		console.log('connecting to ', wsurl);
 		//Now do the connection
 		zone=(zone && zone.length == 32 ? zone : '00000000000000000000000000000000');
 		this.#sock = new WebSocket(wsurl);
 		this.#sock.onclose = e => {
 			console.log('websocket ',wsurl,' closing ',e);
+			if(this.#closed) return; // intentional close() already tore down
+			this.#teardown_peers(); // abandon RTC; IDs are invalid once broker is gone
 			if(this.#recheck_timer !== null){
 				clearInterval(this.#recheck_timer);
 				this.#recheck_timer = null;
 			}
+			this.#closed = true;
 			onclose(e);
 		};
 		this.#sock.onerror = e => {
 			console.log('websocket ',wsurl,' error ',e);
-			if(this.#recheck_timer !== null){
-				clearInterval(this.#recheck_timer);
-				this.#recheck_timer = null;
-			}
+			if(this.#closed) return;
 			onerror(e);
 		};
 		this.#sock.onopen = e => {
 			console.log('websocket opened to ', wsurl);
+			this.#recheck_timer = setInterval(() => this.#sock.send(new Uint8Array([0])), 5000 + Math.random() * 1000); //ping every 5-6 seconds, 1 byte 0
 			this.#sock.send(new Uint32Array([zone.substr(24,8),zone.substr(16,8),zone.substr(8,8),zone.substr(0,8)].map(z=>parseInt(z,16))).buffer);
 		};
 		this.#sock.onmessage = (msg) => this.#handle_websocket_message(msg);
+	}
+
+	// Close socket and all peer/pending RTC without per-peer close callbacks (caller is wiping/resetting).
+	close() {
+		if(this.#closed) {
+			this.#teardown_peers();
+			return;
+		}
+		this.#closed = true;
+		if(this.#recheck_timer !== null){
+			clearInterval(this.#recheck_timer);
+			this.#recheck_timer = null;
+		}
+		this.#teardown_peers();
+		if(this.#sock){
+			this.#sock.onclose = null;
+			this.#sock.onerror = null;
+			this.#sock.onmessage = null;
+			try { this.#sock.close(); } catch(e) {}
+		}
+	}
+
+	#teardown_peers(){
+		for(const peer_id of Object.keys(this.#pending_peer_connections)){
+			try { this.#pending_peer_connections[peer_id].rtcpc.close(); } catch(e) {}
+		}
+		this.#pending_peer_connections = {};
+		for(const peer_id of Object.keys(this.#links)){
+			try {
+				this.#links[peer_id].dc.close();
+				this.#links[peer_id].rtcpc.close();
+			} catch(e) {}
+		}
+		this.#links = {};
+		this.#known_clients.clear();
 	}
 
 	//returns list of peers

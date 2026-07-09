@@ -87,6 +87,8 @@ class Note {
 	#recheck_timer;
 	#directory;
 	#received_chat;
+	#resetting;
+	#want_listen;
 
 	constructor() {
 		this.#idx_links = []; //idx -> Set(nodeidx)
@@ -107,6 +109,8 @@ class Note {
 		this.#con_log_listener = null;
 		this.#debug_mode = false;
 		this.#recheck_timer = null;
+		this.#resetting = false;
+		this.#want_listen = false;
 		const server_cache_string = localStorage.getItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME);
 		this.#known_servers = (server_cache_string === null ? {} : JSON.parse(server_cache_string)); //url -> id
 		this.#timeout = setTimeout(() => this.#dosends(), PING_INTERVAL_MS); //send polls regularly
@@ -132,7 +136,12 @@ class Note {
 			this.#get_or_set_server_id(wsurl); //will connect if it should
 		}
 		this.#recheck_timer = setInterval(() => { //but if they don't in a little bit, connect to one
-			const total_pending = Object.entries(this.#realms).map(a => a[1].rtc.num_pending()).reduce((e, v) => e + v); //sum all num_pending
+			if (Object.keys(this.#realms).length === 0) {
+				clog("No server connections - reconnecting");
+				this.#reconnect_servers();
+				return;
+			}
+			const total_pending = Object.entries(this.#realms).map(a => a[1].rtc.num_pending()).reduce((e, v) => e + v, 0); //sum all num_pending
 			if (total_pending + Object.keys(this.#my_peers).length < MIN_CONNECTIONS) {
 				let validids = [];
 				for (let srvid in this.#realms) {
@@ -147,6 +156,10 @@ class Note {
 					const choice = random_choice(validids);
 					this.#realms[choice[0]].rtc.connectto(choice[1]);
 				}
+			}
+			if (this.#want_listen && this.#idx_links[0] && this.#idx_links[0].size >= 2) {
+				this.#want_listen = false;
+				this.listen().catch(e => { this.#want_listen = true; clog("listen retry later", e); });
 			}
 		}, 5000 + Math.random() * 1000);
 	}
@@ -223,8 +236,8 @@ class Note {
 		clog('connecting to ', wsurl, ' ', server_id, ' ', JSON.stringify(this.#server_ids));
 		//Set up RTC manager with callbacks to us
 		let broker = new RtcBroker(wsurl, null,
-			() => { clog('rtc onclose', wsurl); }, // onclose
-			() => { clog('rtc onerror', wsurl); }, // onerror
+			() => { clog('rtc onclose', wsurl); this.#reset_network('websocket closed ' + wsurl); }, // onclose
+			() => { clog('rtc onerror', wsurl); }, // onerror (close follows and resets)
 			(client_id) => { // onstarted
 				clog('MY ID on ', server_id, ' IS ', client_id);
 				this.#set_node_pubkey(make_id(server_id, client_id), this.#my_keys.pubraw);
@@ -250,6 +263,47 @@ class Note {
 			},
 		);
 		this.#realms[server_id] = { rtc: broker, peer_int_to_idx: {}, queued: {} };
+	}
+
+	// Broker IDs and aliases are server-assigned; after a websocket dies they are stale.
+	// Wipe graph, peers, aliases, close everything, then reconnect.
+	#reset_network(reason) {
+		if (this.#resetting) return;
+		this.#resetting = true;
+		clog('RESET NETWORK', reason);
+		if ('a' in this.#my_forward_chains) this.#want_listen = true;
+		const brokers = Object.values(this.#realms).map(r => r.rtc);
+		this.#realms = {};
+		for (const b of brokers) b.close();
+		this.#my_ids = {};
+		this.#my_peers = {};
+		this.#nodes = {};
+		this.#my_forwards = {};
+		this.#my_forward_chains = {};
+		this.#directory = {};
+		// Keep only self (idx 0) in the graph
+		const self_key = this.#known_keys[0];
+		this.#known_keys = [self_key];
+		this.#known_key_idxs = { [this.#my_keys.pub64]: 0 };
+		this.#idx_links = [new Set()];
+		this.#idx_depths = [null];
+		this.#known_aliases = [new Set()];
+		// Debounce reconnect so multi-server close / offline thrash coalesces
+		setTimeout(() => {
+			this.#reconnect_servers();
+			this.#resetting = false;
+		}, 2000);
+	}
+
+	#reconnect_servers() {
+		const offset = crypto.getRandomValues(new Uint32Array(1))[0] % seedservers.length;
+		for (let wsurl in this.#known_servers) {
+			this.#get_or_set_server_id(wsurl);
+		}
+		for (let i = 0; i < seedservers.length; i++) {
+			const offsetIndex = (i + offset) % seedservers.length;
+			this.#get_or_set_server_id(seedservers[offsetIndex]);
+		}
 	}
 
 	#queue(server_id, peer_int, message) {
@@ -743,7 +797,9 @@ class Note {
 		if (this.#my_hidden_keys === null) {
 			throw 'No chat keys provisioned - must generate or import';
 		}
+		this.#want_listen = true; // re-establish after network reset
 		this.#my_forward_chains['a'] = await this.#setup_forward_chain(true, null);
+		this.#want_listen = false;
 	}
 
 	//Sends a message over the network in a metadata-hiding wrapped way by selecting one or more intermediate hops
