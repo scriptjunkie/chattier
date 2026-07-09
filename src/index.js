@@ -1,7 +1,7 @@
 import { pack, unpack, b64encode, b64decode, splice, concat } from './bits.js';
 import { random_choice, random_path, find_route_of_length, shortest_path, update_depths_link, update_depths_removed } from './algorithms.js';
 import { RtcBroker } from './rtcbroker.js';
-import { generate, encrypt_keys_with_password, decrypt_keys_with_password, wrap_to, seal_to, unseal, sign, verify } from './crypto.js';
+import { generate, encrypt_keys_with_password, decrypt_keys_with_password, encrypt_blob_with_password, decrypt_blob_with_password, wrap_to, seal_to, unseal, sign, verify } from './crypto.js';
 
 const LOCAL_STORAGE_ENC_KEY_NAME = "chattier_encrypted_settings";
 const LOCAL_STORAGE_KNOWN_SERVERS_NAME = "chattier_known_servers";
@@ -223,8 +223,8 @@ class Note {
 		clog('connecting to ', wsurl, ' ', server_id, ' ', JSON.stringify(this.#server_ids));
 		//Set up RTC manager with callbacks to us
 		let broker = new RtcBroker(wsurl, null,
-			() => { clog('yucky'); }, // onclose
-			() => { clog('ducky'); }, // onerror
+			() => { clog('rtc onclose', wsurl); }, // onclose
+			() => { clog('rtc onerror', wsurl); }, // onerror
 			(client_id) => { // onstarted
 				clog('MY ID on ', server_id, ' IS ', client_id);
 				this.#set_node_pubkey(make_id(server_id, client_id), this.#my_keys.pubraw);
@@ -236,19 +236,10 @@ class Note {
 			},
 			(peer_int) => { // onnodeexit
 				clog('onnodeexit', server_id + '_' + peer_int);
-				this.#handle_peer_close(server_id, peer_int);
-				const full_node_id = make_id(server_id, peer_int);
-				if (full_node_id in this.#nodes) {
-					const idx = this.#known_key_idxs[this.#nodes[full_node_id]];
-					if (idx in this.#known_aliases) {
-						clog('onnodeexit', server_id + '_' + peer_int, 'idx', idx);
-						this.#known_aliases[idx].delete(full_node_id);
-					}
-					delete this.#nodes[full_node_id];
-				}
+				this.#handle_peer_close(server_id, peer_int, true);
 			},
 			(message, peer_int) => this.#wrapped_handle_msg(message, server_id, peer_int), //onmessage
-			(peer_int) => this.#handle_peer_close(server_id, peer_int), //onconnclose
+			(peer_int) => this.#handle_peer_close(server_id, peer_int, false), //onconnclose
 			(peer_int) => { //onnewclient
 				if (Math.random() < 2 / (1 + Object.keys(this.#my_peers).length)) { //new peer - connect with decreasing probability
 					clog("Trying to connect to", server_id, peer_int);
@@ -280,28 +271,41 @@ class Note {
 		q.push(message);
 	}
 
-	#handle_peer_close(server_id, peer_int) {
+	#handle_peer_close(server_id, peer_int, from_server) {
+		const full_node_id = make_id(server_id, peer_int);
 		if (peer_int in this.#realms[server_id]) delete this.#realms[server_id].queued[peer_int];
 		//clear node aliases
-		const full_node_id = make_id(server_id, peer_int);
-		if (full_node_id in this.#nodes) {
-			const idx = this.#known_key_idxs[this.#nodes[full_node_id]];
-			for (let fwd in this.#my_forwards) {
-				let next_b64 = b64encode(this.#my_forwards[fwd][0]);
-				if (next_b64 in this.#known_key_idxs && this.#known_key_idxs[next_b64] === idx) {
-					clog("Clearing foward to", idx);
-					delete this.#my_forwards[fwd]; //shut down forward if we lost peer
-				}
+		if (!(full_node_id in this.#nodes)) return clog("ERROR", full_node_id, "not in nodes?"); // probably shouldn't happen?
+		const k = this.#nodes[full_node_id];
+		if(from_server) delete this.#nodes[full_node_id]; //ID no longer valid for this server
+		if (!(k in this.#known_key_idxs)){
+			clog("THIS SHOULDN'T HAPPEN - peer close but already removed from known_key_idxs",k,full_node_id);
+			return;
+		}
+		const idx = this.#known_key_idxs[k];
+		clog('handle_peer_close', full_node_id, 'idx', idx, 'from_server', from_server);
+		if(from_server && idx in this.#known_aliases) this.#known_aliases[idx].delete(full_node_id);
+		for (let fwd in this.#my_forwards) {
+			let next_b64 = b64encode(this.#my_forwards[fwd][0]);
+			if (next_b64 in this.#known_key_idxs && this.#known_key_idxs[next_b64] === idx) {
+				clog("Clearing foward to", idx);
+				delete this.#my_forwards[fwd]; //shut down forward if we lost peer
 			}
-			//Now close peer conn
-			if (idx in this.#my_peers && server_id in this.#my_peers[idx]) {
-				delete this.#my_peers[idx][server_id];
-				clog("lost link 0 <-> " + idx + " now num ", Object.keys(this.#my_peers[idx]).length);
-				if (Object.keys(this.#my_peers[idx]).length === 0) { // no longer link to that pkey
-					delete this.#my_peers[idx];
-					this.#forget_known_link(0, idx);
-				}
-			} else clog("ERROR we lost link", their_node_id, "(", idx, ") but did not have it?");
+		}
+		//Now close peer conn
+		if (idx in this.#my_peers && server_id in this.#my_peers[idx]) {
+			delete this.#my_peers[idx][server_id];
+			clog("lost link 0 <-> " + idx + " now num ", Object.keys(this.#my_peers[idx]).length);
+			if (Object.keys(this.#my_peers[idx]).length === 0) { // no longer link to that pkey
+				delete this.#my_peers[idx];
+				this.#forget_known_link(0, idx);
+			}
+		} else clog("We lost link", full_node_id, "(", idx, ") but did not have a connection - possibly alias closed already");
+		if (!(idx in this.#idx_links)){
+			clog("now all aliases")
+			const k = this.#known_keys[idx];
+			this.#known_keys[idx] = null;
+			delete this.#known_key_idxs[b64encode(k)];
 		}
 	}
 
@@ -389,7 +393,7 @@ class Note {
 			while (queue.length > 0) {
 				const unreachable_idx = queue.shift();
 				clog("clearing ", unreachable_idx);
-				if (unreachable_idx in this.#my_peers) clog("ERROR: this should never happen: ", unreachable_idx, "in peers");
+				if (unreachable_idx in this.#my_peers)clog("ERROR: this should never happen: ", unreachable_idx, "in peers");
 				for (let next of Array.from(this.#idx_links[unreachable_idx])) { //remove al
 					queue.push(next);
 					delete this.#idx_links[unreachable_idx][next];
@@ -400,6 +404,8 @@ class Note {
 					const k = this.#known_keys[unreachable_idx];
 					this.#known_keys[unreachable_idx] = null;
 					delete this.#known_key_idxs[b64encode(k)];
+				}else{
+					clog("Keeping node around? Known aliases ", Array.from(this.#known_aliases[unreachable_idx].keys()));
 				}
 			}
 		}
@@ -854,6 +860,25 @@ function make_id(server_id, client_id) {
 	return server_id + '_' + client_id;
 }
 
+// Store an arbitrary JSON-serializable object as a password-encrypted blob in localStorage.
+// Plaintext is padded to a multiple of block_size so stored size does not leak object length.
+// Returns the base64 ciphertext (also written to localStorage under storage_key).
+async function store_encrypted_object(storage_key, obj, password, block_size) {
+	const encrypted = await encrypt_blob_with_password(obj, password, block_size);
+	localStorage.setItem(storage_key, encrypted);
+	return encrypted;
+}
+
+// Load and decrypt an object previously stored with store_encrypted_object.
+// If encrypted is omitted, reads from localStorage under storage_key.
+async function load_encrypted_object(storage_key, password, encrypted) {
+	if (typeof encrypted === 'undefined' || encrypted === null)
+		encrypted = localStorage.getItem(storage_key);
+	if (encrypted === null)
+		throw new Error('no encrypted blob for key ' + storage_key);
+	return await decrypt_blob_with_password(encrypted, password);
+}
+
 let context = new Note();
 
 //Start loading
@@ -864,4 +889,4 @@ if (localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME) === null) {
 	context.generate_keys().then(() => context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
 }
 
-export { Note, context };
+export { Note, context, store_encrypted_object, load_encrypted_object };
