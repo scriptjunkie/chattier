@@ -1,12 +1,48 @@
-import { b64encode, b64decode, splice, concat } from './bits.js';
+import { pack, unpack, b64encode, b64decode, splice, concat } from './bits.js';
 const KEY_LENGTH = 65;
+
+// Derive AES-GCM wrapping key from password + salt (shared by key and blob helpers)
+async function wrapping_key_from_password(password, salt) {
+	const pbkdfKey = await crypto.subtle.importKey('raw', (new TextEncoder()).encode(password), { name: 'PBKDF2' }, false, ['deriveBits', 'deriveKey']);
+	return await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, pbkdfKey, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+}
+
+// Encrypt an arbitrary JSON-serializable object. Plaintext is length-prefixed and
+// padded with random bytes to a multiple of block_size so ciphertext size does not leak object length.
+async function encrypt_blob_with_password(obj, password, block_size) {
+	if (!(block_size > 0) || (block_size | 0) !== block_size) {
+		throw new Error('block_size must be a positive integer');
+	}
+	const plaintext = new TextEncoder().encode(JSON.stringify(obj));
+	const length_prefix = pack(plaintext.length);
+	const unpadded_len = length_prefix.length + plaintext.length;
+	const pad_len = (block_size - (unpadded_len % block_size)) % block_size;
+	const padded = concat(length_prefix, plaintext, crypto.getRandomValues(new Uint8Array(pad_len)));
+	const salt = crypto.getRandomValues(new Uint8Array(16));
+	const iv = crypto.getRandomValues(new Uint8Array(16));
+	const wrappingKey = await wrapping_key_from_password(password, salt);
+	const wrapped = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, wrappingKey, padded);
+	return b64encode(new Uint8Array(await (new Blob([salt, iv, wrapped])).arrayBuffer()));
+}
+
+// Decrypt a blob produced by encrypt_blob_with_password; returns the original object.
+async function decrypt_blob_with_password(encrypted, password) {
+	const enckbin = b64decode(encrypted);
+	const salt = enckbin.subarray(0, 16);
+	const iv = enckbin.subarray(16, 32);
+	const wrappingKey = await wrapping_key_from_password(password, salt);
+	const dewrapped = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, wrappingKey, enckbin.subarray(32)));
+	let inner_length, rest;
+	[inner_length, rest] = unpack(dewrapped);
+	const [json_bytes] = splice(rest, inner_length);
+	return JSON.parse(new TextDecoder().decode(json_bytes));
+}
 
 async function decrypt_keys_with_password(encryptedKey, password){
 	const enckbin = b64decode(encryptedKey);
 	const salt = enckbin.subarray(0,16);
 	const iv = enckbin.subarray(16,32);
-	const pbkdfKey = await crypto.subtle.importKey('raw',(new TextEncoder()).encode(password),{ name: 'PBKDF2' }, false, ['deriveBits', 'deriveKey']);
-	const wrappingKey = await crypto.subtle.deriveKey({name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256'}, pbkdfKey, { name: 'AES-GCM', length: 256 },true,['encrypt', 'decrypt']);
+	const wrappingKey = await wrapping_key_from_password(password, salt);
 	const exported_k = enckbin.subarray(32);
 	const dewrapped = await crypto.subtle.decrypt({name: 'AES-GCM', iv}, wrappingKey, exported_k);
 	const {data, exported} = JSON.parse(new TextDecoder().decode(dewrapped));
@@ -29,9 +65,8 @@ async function decrypt_keys_with_password(encryptedKey, password){
 }
 
 async function encrypt_keys_with_password(key, password, data){
-	const pbkdfKey = await crypto.subtle.importKey('raw',(new TextEncoder()).encode(password),{ name: 'PBKDF2' }, false, ['deriveBits', 'deriveKey']);
 	const salt = crypto.getRandomValues(new Uint8Array(16));
-	const wrappingKey = await crypto.subtle.deriveKey({name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256'}, pbkdfKey, { name: 'AES-GCM', length: 256 },true,['encrypt', 'decrypt']);
+	const wrappingKey = await wrapping_key_from_password(password, salt);
 	const iv = crypto.getRandomValues(new Uint8Array(16));
 	const exported = b64encode(new Uint8Array(await crypto.subtle.exportKey('pkcs8', key)));
 	const bin = new TextEncoder().encode(JSON.stringify({data, exported}));
@@ -94,4 +129,4 @@ async function verify(data, sig, publicKey){
 	return await crypto.subtle.verify({name: 'ECDSA', hash: 'SHA-256'}, publicKey, sig, data);
 }
 
-export { generate, encrypt_keys_with_password, decrypt_keys_with_password, wrap_to, seal_to, unseal, sign, verify };
+export { generate, encrypt_keys_with_password, decrypt_keys_with_password, encrypt_blob_with_password, decrypt_blob_with_password, wrap_to, seal_to, unseal, sign, verify };
