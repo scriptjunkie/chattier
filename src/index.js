@@ -5,6 +5,8 @@ import { generate, encrypt_keys_with_password, decrypt_keys_with_password, encry
 
 const LOCAL_STORAGE_ENC_KEY_NAME = "chattier_encrypted_settings";
 const LOCAL_STORAGE_KNOWN_SERVERS_NAME = "chattier_known_servers";
+const CHATLOGS_STORAGE_KEY = 'chatter_chatlogs';
+const CHATLOGS_BLOCK_SIZE = 10240;
 
 const MIN_CONNECTIONS = 2; //try to always ensure this many connections
 
@@ -919,17 +921,16 @@ function make_id(server_id, client_id) {
 // Store an arbitrary JSON-serializable object as a password-encrypted blob in localStorage.
 // Plaintext is padded to a multiple of block_size so stored size does not leak object length.
 // Returns the base64 ciphertext (also written to localStorage under storage_key).
-async function store_encrypted_object(storage_key, obj, password, block_size) {
-	const encrypted = await encrypt_blob_with_password(obj, password, block_size);
-	localStorage.setItem(storage_key, encrypted);
+async function store_chatlogs(obj, password) {
+	const encrypted = await encrypt_blob_with_password(obj, password, CHATLOGS_BLOCK_SIZE);
+	localStorage.setItem(CHATLOGS_STORAGE_KEY, encrypted);
 	return encrypted;
 }
 
-// Load and decrypt an object previously stored with store_encrypted_object.
+// Load and decrypt an object previously stored with store_chatlogs
 // If encrypted is omitted, reads from localStorage under storage_key.
-async function load_encrypted_object(storage_key, password, encrypted) {
-	if (typeof encrypted === 'undefined' || encrypted === null)
-		encrypted = localStorage.getItem(storage_key);
+async function load_chatlogs(password) {
+	encrypted = localStorage.getItem(CHATLOGS_STORAGE_KEY);
 	if (encrypted === null)
 		throw new Error('no encrypted blob for key ' + storage_key);
 	return await decrypt_blob_with_password(encrypted, password);
@@ -944,5 +945,9 @@ context.init();
 if (localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME) === null) {
 	context.generate_keys().then(() => context.export_keys_with_password(b64encode(crypto.getRandomValues(new Uint8Array(16)))));
 }
+//save dummy encrypted logs with random PW even if never used
+if (localStorage.getItem(CHATLOGS_STORAGE_KEY) === null) {
+	store_chatlogs({}, b64encode(crypto.getRandomValues(new Uint8Array(16))));
+}
 
-export { Note, context, store_encrypted_object, load_encrypted_object };
+export { Note, context, store_chatlogs, load_chatlogs };

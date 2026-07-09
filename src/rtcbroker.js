@@ -153,7 +153,18 @@ class RtcBroker {
 			const peer_id = new Uint32Array(u8.slice(1,5).buffer)[0];
 			const rtcRequest = JSON.parse((new TextDecoder()).decode(u8.subarray(5)));
 			console.log('RTC RESPONDER 1/8 CODE_CLIENT_RTC_REQUEST', rtcRequest, 'from', peer_id);
-			
+
+			const submitIces = (rtcpeerconn, ice_list) => {
+				for(let i = 0; i < ice_list.length; i++){
+					const icej = JSON.stringify(ice_list[i]);
+					if(!(icej in this.#pending_peer_connections[peer_id].ices)){ //it's a new one
+						this.#pending_peer_connections[peer_id].ices[icej] = 1;
+						console.log('RTC RESPONDER 4/8 adding received ICE candidate '+icej, peer_id);
+						rtcpeerconn.addIceCandidate(ice_list[i]);
+					}
+				}
+			};
+
 			while(peer_id in this.#pending_peer_connections){
 				console.log('already in pending_peer_connections with state of ', this.#pending_peer_connections[peer_id].rtcpc.connectionState, ' and ice connection state of ',this.#pending_peer_connections[peer_id].rtcpc.iceConnectionState,' maybe learned new ICE option?');
 				if(typeof this.#pending_peer_connections[peer_id].ices === 'undefined'){
@@ -170,17 +181,6 @@ class RtcBroker {
 				}
 				return; //DONE
 			}
-
-			let submitIces = (rtcpeerconn, ice_list) => {
-				for(let i = 0; i < ice_list.length; i++){
-					const icej = JSON.stringify(ice_list[i]);
-					if(!(icej in this.#pending_peer_connections[peer_id].ices)){ //it's a new one
-						this.#pending_peer_connections[peer_id].ices[icej] = 1;
-						console.log('RTC RESPONDER 4/8 adding received ICE candidate '+icej, peer_id);
-						rtcpeerconn.addIceCandidate(ice_list[i]);
-					}
-				}
-			};
 
 			//create connection with same stun server hopefully
 			let inboundPeerConn = new RTCPeerConnection({iceServers: [{urls:[iceserver]}]});
@@ -206,8 +206,9 @@ class RtcBroker {
 			let inboundIces = [];
 			let answerReady = false;
 			let completed = false;
+			// Send answer once we have any local ICE (including mDNS .local). Re-send when better (srflx/relay) candidates arrive.
 			let completer = (forceit) => {
-				if((completed && !forceit) || answerReady === false || (inboundPeerConn.connectionState !== 'connected' && inboundIces.length === 0))
+				if((completed && !forceit) || answerReady === false || inboundIces.length === 0 || inboundPeerConn.connectionState === 'connected')
 					return;
 				console.log('RTC RESPONDER 6/8 Sending RTC answer', JSON.stringify(inboundIces), ' to ', peer_id, ' from ', this.#client_id);
 				completed = true;
@@ -253,33 +254,56 @@ class RtcBroker {
 				if(e.candidate && e.candidate.candidate) {
 					console.log('RTC RESPONDER 5/8 Peer ICE candidate',e.candidate.candidate, ' ice gathering state ', inboundPeerConn.iceGatheringState, peer_id);
 					inboundIces.push(e.candidate);
-					if(e.candidate.candidate.indexOf('.local') === -1){
-						completer(true);
-					}
+					// First candidate (even .local) sends the answer; public candidates re-send with force.
+					completer(e.candidate.candidate.indexOf('.local') === -1);
+				} else if (!e.candidate) {
+					completer(true); // end-of-candidates
 				}
 			};
 			inboundPeerConn.onicecandidateerror = e => console.log('RTC RESPONDER ice candidate error '+JSON.stringify(e));
-			inboundPeerConn.onicegatheringstatechange = e => console.log('RTC RESPONDER ice gathering state change ', e.target.iceGatheringState);
-			inboundPeerConn.oniceconnectionstatechange = e => console.log('RTC RESPONDER ice connection state change ', e.target.iceConnectionState);
+			inboundPeerConn.onicegatheringstatechange = e => {
+				console.log('RTC RESPONDER ice gathering state change ', e.target.iceGatheringState);
+				if(e.target.iceGatheringState === 'complete') completer(true);
+			};
+			inboundPeerConn.oniceconnectionstatechange = e => {
+				console.log('RTC RESPONDER ice connection state change ', e.target.iceConnectionState);
+				if(e.target.iceConnectionState === 'connected' || e.target.iceConnectionState === 'completed')
+					completer(false);
+			};
 		}else if(u8[0] == CODE_CLIENT_RTC_RESPONSE && u8.length > 5){
 			const peer_id = new Uint32Array(u8.slice(1,5).buffer)[0];
 			const rtcResponse = JSON.parse((new TextDecoder()).decode(u8.subarray(5)));
 			if(peer_id in this.#pending_peer_connections){
 				console.log('RTC INITIATOR 6/11 CODE_CLIENT_RTC_RESPONSE', rtcResponse, peer_id);
-				let followup = () => {
-					if(this.#pending_peer_connections[peer_id].rtcpc.connectionState !== 'connected'){
-						this.#pending_peer_connections[peer_id].remoteRTC = rtcResponse;
-						for(let i = 0; i < rtcResponse.connectToMePlz.length; i++){
-							console.log('RTC INITIATOR 8/11 RTC_RESPONSE adding received ICE candidate '+JSON.stringify(rtcResponse.connectToMePlz[i]));
-							if(!this.#pending_peer_connections[peer_id].rtcpc.canTrickleIceCandidates) console.log('RTC INITIATOR WARNING: other side cannot trickle ICE candidates. Nonstandard browser?');
-							this.#pending_peer_connections[peer_id].rtcpc.addIceCandidate(rtcResponse.connectToMePlz[i]);
-						}
+				const pending = this.#pending_peer_connections[peer_id];
+				const applyIces = (ice_list) => {
+					if(!(peer_id in this.#pending_peer_connections)) return;
+					if(pending.rtcpc.connectionState === 'connected') return;
+					pending.remoteRTC = rtcResponse;
+					for(let i = 0; i < ice_list.length; i++){
+						console.log('RTC INITIATOR 8/11 RTC_RESPONSE adding received ICE candidate '+JSON.stringify(ice_list[i]));
+						if(!pending.rtcpc.canTrickleIceCandidates) console.log('RTC INITIATOR WARNING: other side cannot trickle ICE candidates. Nonstandard browser?');
+						pending.rtcpc.addIceCandidate(ice_list[i]).catch(e => console.log('addIceCandidate failed', e));
 					}
 				};
-				if(this.#pending_peer_connections[peer_id].rtcpc.remoteDescription)
-					followup();
-				else
-					this.#pending_peer_connections[peer_id].rtcpc.setRemoteDescription(rtcResponse.description).then(followup);
+				// Answer SDP only once (have-local-offer). Later responses re-send answer+ICE; apply ICE only.
+				// Guard against concurrent responses both calling setRemoteDescription before the first settles.
+				if(pending.rtcpc.signalingState === 'have-local-offer' && !pending.settingRemote){
+					pending.settingRemote = true;
+					pending.rtcpc.setRemoteDescription(rtcResponse.description).then(() => {
+						applyIces(rtcResponse.connectToMePlz);
+						const queued = pending.queuedIces || [];
+						pending.queuedIces = [];
+						if(queued.length) applyIces(queued);
+					}).catch(e => {
+						console.log('setRemoteDescription failed', e);
+						pending.settingRemote = false;
+					});
+				}else if(pending.settingRemote && pending.rtcpc.signalingState === 'have-local-offer'){
+					pending.queuedIces = (pending.queuedIces || []).concat(rtcResponse.connectToMePlz);
+				}else{
+					applyIces(rtcResponse.connectToMePlz);
+				}
 			} else {
 				console.log('Unknown CODE_CLIENT_RTC_RESPONSE? Not waiting for '+peer_id);
 			}
@@ -351,9 +375,12 @@ class RtcBroker {
 		};
 		let ices = [];
 		let offerReady = false;
-		let completeit = () => {
-			if(ices.length === 0 || offerReady === false)
+		let offerSent = false;
+		// Send offer with any ICE (including .local); re-send when srflx/relay arrives or gathering ends.
+		let completeit = (forceit) => {
+			if(ices.length === 0 || offerReady === false || (offerSent && !forceit))
 				return;
+			offerSent = true;
 			console.log('RTC INITIATOR 5/11 telling other side (',peer_id,') ICE candidates',ices);
 			//now tell other side the ice candidates
 			let plaintxt = JSON.stringify({connectToMePlz: ices, description: peer.localDescription});
@@ -370,19 +397,22 @@ class RtcBroker {
 		peer.createOffer().then(offer => peer.setLocalDescription(offer).then(() => {
 			offerReady = true;
 			console.log('RTC INITIATOR 3/11 ',offer);
-			completeit();
+			completeit(false);
 		}));
 		peer.onicecandidate = e => {
 			if(e.candidate && e.candidate.candidate){
 				console.log('RTC INITIATOR 4/11 ICE candidate',e.candidate.candidate);
 				ices.push(e.candidate);
-				if(e.candidate.candidate.indexOf('.local') === -1){
-					completeit();
-				}
+				completeit(e.candidate.candidate.indexOf('.local') === -1);
+			} else if (!e.candidate) {
+				completeit(true);
 			}
 		};
 		peer.onicecandidateerror = e => console.log('RTC INITIATOR ice candidate error '+JSON.stringify(e));
-		peer.onicegatheringstatechange = e => console.log('RTC INITIATOR ice gathering state change ', e.target.iceGatheringState);
+		peer.onicegatheringstatechange = e => {
+			console.log('RTC INITIATOR ice gathering state change ', e.target.iceGatheringState);
+			if(e.target.iceGatheringState === 'complete') completeit(true);
+		};
 		peer.oniceconnectionstatechange = e => console.log('RTC INITIATOR ice connection state change ', e.target.iceConnectionState);
 		peer.onsignalingstatechange = e => {
 			if(peer.signalingState === 'have-local-offer')
