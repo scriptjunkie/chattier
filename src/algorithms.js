@@ -21,10 +21,10 @@ function update_depths_added(idx_links, idx_depths, start_idx, start_depth){
 
 //Same, but wrapped to figure out initial/continuing depth automatically
 function update_depths_link(idx_links, idx_depths, alice_idx, bob_idx){
-	if(alice_idx === 0) update_depths_added(idx_links, idx_depths, alice_idx, 1);
-	else if(bob_idx === 0) update_depths_added(idx_links, idx_depths, bob_idx, 1);
+	// Self (0) is depth 1; ensure base depth then update the other endpoint (restarting from 0 early-outs after the first peer)
+	if(idx_depths[0] === null && (alice_idx === 0 || bob_idx === 0)) idx_depths[0] = 1;
 	//New node cases
-	else if(idx_depths[alice_idx] === null) update_depths_added(idx_links, idx_depths, alice_idx, idx_depths[bob_idx] + 1);
+	if(idx_depths[alice_idx] === null) update_depths_added(idx_links, idx_depths, alice_idx, idx_depths[bob_idx] + 1);
 	else if(idx_depths[bob_idx] === null) update_depths_added(idx_links, idx_depths, bob_idx, idx_depths[alice_idx] + 1);
 	//New link, existing node cases
 	else if(idx_depths[alice_idx] > idx_depths[bob_idx]) update_depths_added(idx_links, idx_depths, alice_idx, idx_depths[bob_idx] + 1);
