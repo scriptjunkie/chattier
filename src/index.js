@@ -9,6 +9,8 @@ const CHATLOGS_STORAGE_KEY = 'chatter_chatlogs';
 const CHATLOGS_BLOCK_SIZE = 10240;
 
 const MIN_CONNECTIONS = 2; //try to always ensure this many connections
+const NETWORK_STATUS_MIN_NODES = 5; // below this → yellow
+const NETWORK_STATUS_MIN_DIRECT_LINKS = 3; // below this → yellow
 
 const MESSAGE_SELF_ANNOUNCE = 0x11; //announce your pubkey and ID's
 const MESSAGE_KNOWN_KEYS_AND_LINKS = 0x12;
@@ -91,6 +93,8 @@ class Note {
 	#received_chat;
 	#resetting;
 	#want_listen;
+	#network_status_change;
+	#last_network_status_key;
 
 	constructor() {
 		this.#idx_links = []; //idx -> Set(nodeidx)
@@ -113,6 +117,8 @@ class Note {
 		this.#recheck_timer = null;
 		this.#resetting = false;
 		this.#want_listen = false;
+		this.#network_status_change = null;
+		this.#last_network_status_key = null;
 		const server_cache_string = localStorage.getItem(LOCAL_STORAGE_KNOWN_SERVERS_NAME);
 		this.#known_servers = (server_cache_string === null ? {} : JSON.parse(server_cache_string)); //url -> id
 		this.#timeout = setTimeout(() => this.#dosends(), PING_INTERVAL_MS); //send polls regularly
@@ -161,7 +167,7 @@ class Note {
 			}
 			if (this.#want_listen && this.#idx_links[0] && this.#idx_links[0].size >= 2) {
 				this.#want_listen = false;
-				this.listen().catch(e => { this.#want_listen = true; clog("listen retry later", e); });
+				this.listen().catch(e => { this.#want_listen = true; this.#notify_network_status(); clog("listen retry later", e); });
 			}
 		}, 5000 + Math.random() * 1000);
 	}
@@ -179,14 +185,16 @@ class Note {
 	}
 
 	//Brand new start method, generating new keys and initializing callback for new chats
-	async generate_keys(received_chat, screen_name) {
+	async generate_keys(received_chat, screen_name, network_status_change) {
 		this.#my_hidden_keys = await generate();
 		this.#received_chat = received_chat;
+		this.#network_status_change = network_status_change || null;
 		this.set_screen_name(this.#my_keys.pub64, screen_name);
+		this.#notify_network_status(true);
 	}
 
 	//load stored keys with password, starting a functional chat client with a callback for new chats
-	async set_keys_from_password(password, received_chat, encrypted) {
+	async set_keys_from_password(password, received_chat, network_status_change, encrypted) {
 		if (typeof encrypted === "undefined" || encrypted === null)
 			encrypted = localStorage.getItem(LOCAL_STORAGE_ENC_KEY_NAME);
 		this.#my_hidden_keys = await decrypt_keys_with_password(encrypted, password);
@@ -194,7 +202,36 @@ class Note {
 		screen_name = screen_name.substr(0, screen_name.length - ((128 - (screen_name_len % 128)) % 128)); //remove padding
 		this.set_screen_name(this.#my_keys.pub64, screen_name); //Save locally
 		this.#received_chat = received_chat;
+		this.#network_status_change = network_status_change || null;
 		clog('my keys loaded', this.#my_hidden_keys.pub64);
+		this.#notify_network_status(true);
+	}
+
+	// Snapshot of mesh health for UI / diagnostics.
+	// level: 'red' (no direct links or listen chain not up), 'yellow' (thin mesh), 'green' (ok)
+	network_status() {
+		const direct_links = Object.keys(this.#my_peers).length;
+		let known_nodes = 0;
+		for (let i = 0; i < this.#known_keys.length; i++) {
+			if (this.#known_keys[i] !== null) known_nodes++;
+		}
+		const listening = 'a' in this.#my_forward_chains;
+		let level = 'green';
+		if (direct_links === 0 || !listening)
+			level = 'red';
+		else if (direct_links < NETWORK_STATUS_MIN_DIRECT_LINKS || known_nodes < NETWORK_STATUS_MIN_NODES)
+			level = 'yellow';
+		return { level, listening, direct_links, known_nodes };
+	}
+
+	#notify_network_status(force) {
+		const status = this.network_status();
+		const key = status.level + '|' + status.listening + '|' + status.direct_links + '|' + status.known_nodes;
+		if (!force && key === this.#last_network_status_key) return;
+		this.#last_network_status_key = key;
+		if (typeof this.#network_status_change === 'function') {
+			try { this.#network_status_change(status); } catch (e) { clog('network_status_change error', e); }
+		}
 	}
 
 	async export_keys_with_password(password) {
@@ -290,6 +327,7 @@ class Note {
 		this.#idx_links = [new Set()];
 		this.#idx_depths = [null];
 		this.#known_aliases = [new Set()];
+		this.#notify_network_status();
 		// Debounce reconnect so multi-server close / offline thrash coalesces
 		setTimeout(() => {
 			this.#reconnect_servers();
@@ -363,6 +401,7 @@ class Note {
 			this.#known_keys[idx] = null;
 			delete this.#known_key_idxs[b64encode(k)];
 		}
+		this.#notify_network_status();
 	}
 
 	//Notes a server/peer ID is a given pubkey and returns the idx
@@ -392,6 +431,7 @@ class Note {
 			this.#idx_depths[new_idx] = null;
 			this.#known_aliases[new_idx] = new Set();
 			this.#idx_links[new_idx] = new Set();
+			this.#notify_network_status();
 		} else if (!(pub64 in this.#known_key_idxs) && noadd) {
 			return null;
 		}
@@ -423,6 +463,7 @@ class Note {
 		this.#idx_links[alice_idx].add(bob_idx);
 		this.#idx_links[bob_idx].add(alice_idx);
 		update_depths_link(this.#idx_links, this.#idx_depths, alice_idx, bob_idx); //Update new depths
+		this.#notify_network_status();
 	}
 
 	#forget_known_link(alice_idx, bob_idx, reporter_idx) {
@@ -440,7 +481,8 @@ class Note {
 					if (this.#idx_depths[chain_el.host_idx] !== null) continue;
 					clog("LOST CHAIN - lost idx", chain_el.host_idx);
 					delete this.#my_forward_chains[chain];
-					if (chain === 'a') this.listen(); //re-set-up forwards
+					this.#notify_network_status();
+					if (chain === 'a') this.listen().catch(e => { this.#want_listen = true; this.#notify_network_status(); clog("listen after chain loss failed", e); }); //re-set-up forwards
 					break;
 				}
 			}
@@ -452,8 +494,8 @@ class Note {
 				if (unreachable_idx in this.#my_peers)clog("ERROR: this should never happen: ", unreachable_idx, "in peers");
 				for (let next of Array.from(this.#idx_links[unreachable_idx])) { //remove al
 					queue.push(next);
-					delete this.#idx_links[unreachable_idx][next];
-					delete this.#idx_links[next][unreachable_idx];
+					this.#idx_links[unreachable_idx].delete(next);
+					this.#idx_links[next].delete(unreachable_idx);
 				}
 				//Now #idx_links should be empty for this node. Keep node around if in known_aliases/nodes until it gets removed by the server.
 				if (this.#known_keys[unreachable_idx] && this.#known_aliases[unreachable_idx].size === 0) {
@@ -465,6 +507,7 @@ class Note {
 				}
 			}
 		}
+		this.#notify_network_status();
 	}
 
 	//what to do when a new peer connection happens
@@ -538,6 +581,7 @@ class Note {
 			this.#my_peers[their_idx][server_id] = peer_int;
 			if (!(peer_int in this.#realms[server_id].queued)) this.#realms[server_id].queued[peer_int] = [];
 			this.#realms[server_id].peer_int_to_idx[peer_int] = their_idx;
+			this.#notify_network_status();
 			let their_server_id_to_ours = {};
 			while (message.length > 0) {
 				let their_server_id, server_url_length, server_url_bin;
@@ -800,8 +844,18 @@ class Note {
 			throw 'No chat keys provisioned - must generate or import';
 		}
 		this.#want_listen = true; // re-establish after network reset
-		this.#my_forward_chains['a'] = await this.#setup_forward_chain(true, null);
-		this.#want_listen = false;
+		// Drop prior listen chain while rebuilding so status reflects red until ready
+		delete this.#my_forward_chains['a'];
+		this.#notify_network_status();
+		try {
+			this.#my_forward_chains['a'] = await this.#setup_forward_chain(true, null);
+			this.#want_listen = false;
+			this.#notify_network_status();
+		} catch (e) {
+			this.#want_listen = true;
+			this.#notify_network_status();
+			throw e;
+		}
 	}
 
 	//Sends a message over the network in a metadata-hiding wrapped way by selecting one or more intermediate hops
@@ -927,12 +981,11 @@ async function store_chatlogs(obj, password) {
 	return encrypted;
 }
 
-// Load and decrypt an object previously stored with store_chatlogs
-// If encrypted is omitted, reads from localStorage under storage_key.
+// Load and decrypt an object previously stored with store_chatlogs.
 async function load_chatlogs(password) {
-	encrypted = localStorage.getItem(CHATLOGS_STORAGE_KEY);
+	const encrypted = localStorage.getItem(CHATLOGS_STORAGE_KEY);
 	if (encrypted === null)
-		throw new Error('no encrypted blob for key ' + storage_key);
+		throw new Error('no encrypted blob for key ' + CHATLOGS_STORAGE_KEY);
 	return await decrypt_blob_with_password(encrypted, password);
 }
 
