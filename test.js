@@ -50,20 +50,20 @@ describe('test upd', () => {
   let idx_links = [new Set([3,5]), new Set([2,4]), new Set([1,3]), new Set([0,2]), new Set([1]), new Set([0])];
   let idx_depths = [null,null,null,null,null,null];
   update_depths_added(idx_links, idx_depths, 0, 1);
-  assert.strictEqual(idx_depths, [1,4,3,2,5,2]);
+  assert.deepStrictEqual(idx_depths, [1,4,3,2,5,2]);
   idx_links[2].delete(3);
   idx_links[3].delete(2);
-  assert.strictEqual(update_depths_removed(idx_links, idx_depths, 2, 3) !== null, true);
-  assert.strictEqual(idx_depths, [1, null, null, 2, null, 2]);
+  assert.deepStrictEqual(update_depths_removed(idx_links, idx_depths, 2, 3) !== null, true);
+  assert.deepStrictEqual(idx_depths, [1, null, null, 2, null, 2]);
 
   idx_links = [new Set([1,2]), new Set([0,3,4]), new Set([0,5]), new Set([1,4,6]), new Set([1,3,5]), new Set([2,4,6]), new Set([3,5])];
   idx_depths = [null,null,null,null,null,null,null];
   update_depths_added(idx_links, idx_depths, 0, 1);
-  assert.strictEqual(idx_depths,[1,2,2,3,3,3,4]);
+  assert.deepStrictEqual(idx_depths,[1,2,2,3,3,3,4]);
   idx_links[0].delete(1);
   idx_links[1].delete(0);
   assert.strictEqual(null,update_depths_removed(idx_links, idx_depths, 0,1));
-  assert.strictEqual(idx_depths,[1, 5, 2, 5, 4, 3, 4]);
+  assert.deepStrictEqual(idx_depths,[1, 5, 2, 5, 4, 3, 4]);
 
   idx_links = [new Set([1,2]), new Set([2,0]), new Set([1,0])];
   idx_depths = [null, null, null];
@@ -84,7 +84,7 @@ describe('test upd', () => {
       idx_depths.push(null);
       idx_links.push(new Set());
     }
-    all_links = [];
+    let all_links = [];
     for(let j = 0; j < size; j++){
       const rank = Math.min(size - 1, crypto.getRandomValues(new Uint32Array(1))[0] % 4);
       for(let k = 0; k < rank; k++){
@@ -95,9 +95,7 @@ describe('test upd', () => {
       }
     }
     if(all_links.length === 0) continue;
-    update_depths_added(idx_links, idx_depths, 0, 1);
-//    const orig_idx_links = idx_links.map(s=>'new Set(['+Array.from(s)+'])').join(',');
-//    const orig_idx_depths = JSON.stringify(idx_depths);
+    update_depths_added(idx_links, idx_depths, 0, 1);;
     //now our initial graph is set up. Let's rm a random link
     let linksrc,linkdst;
     [linksrc, linkdst] = random_choice(all_links);
@@ -109,9 +107,5 @@ describe('test upd', () => {
     update_depths_added(idx_links, idx_depths, 0, 1);
     const calc2 = JSON.stringify(idx_depths);
     assert.strictEqual(calc1,calc2);
-//    if(calc1 !== calc2){
-//      console.log("UH OH",calc1,"!=",calc2);
-//      console.log('linksrc = '+linksrc+';linkdst = '+linkdst+';idx_links = ['+orig_idx_links+'];idx_depths='+orig_idx_depths+';idx_links[linksrc].delete(linkdst);idx_links[linkdst].delete(linksrc);update_depths_removed(idx_links, idx_depths, linksrc, linkdst);');
-//    }
   }
 });
